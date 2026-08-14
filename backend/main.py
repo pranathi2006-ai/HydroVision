@@ -33,10 +33,21 @@ ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-ms
 store = Store(DATA_DIR / "hydrovision.sqlite3")
 detector = LocalDetector()
 
+allowed_origins = {
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://hydrovision-local-inspection.deepdrishti-8567.chatgpt.site",
+}
+allowed_origins.update(
+    origin.strip()
+    for origin in os.getenv("HYDROVISION_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+)
+
 app = FastAPI(title="HydroVision local inspection API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=sorted(allowed_origins),
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Content-Type"],
