@@ -16,10 +16,11 @@ const geistMono = Geist_Mono({
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
   const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host") ?? "localhost:3000";
-  const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
+  const privateHost = /^(?:localhost|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(host);
+  const protocol = requestHeaders.get("x-forwarded-proto") ?? (privateHost ? "http" : "https");
   const origin = `${protocol}://${host}`;
   const title = "HydroVision — Visual Inspection & Digital Twin";
-  const description = "Local-first hydropower equipment inspection for leaks, corrosion and evidence review.";
+  const description = "Local-first hydropower equipment inspection for leaks, corrosion and visual evidence.";
   return {
     title,
     description,

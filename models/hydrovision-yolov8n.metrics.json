@@ -1,0 +1,9 @@
+{
+  "weights": "/Users/dspl_017/HydroVision/models/hydrovision-yolov8n.pt",
+  "classes": {
+    "0": "oil_leak",
+    "1": "corrosion"
+  },
+  "map50": 0.8741044465751514,
+  "map50_95": 0.6640658675652393
+}

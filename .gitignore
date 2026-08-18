@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+/.venv/
 /.pnp
 .pnp.*
 .yarn/*
@@ -34,6 +35,11 @@ yarn-error.log*
 
 # local inspection evidence and SQLite state
 /data/
+
+# downloaded training data, run artifacts, and local model weights
+/datasets/
+/runs/
+/models/*.pt
 
 # vercel
 .vercel

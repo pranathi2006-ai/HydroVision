@@ -55,7 +55,8 @@ class Store:
                     height INTEGER NOT NULL,
                     source_video TEXT,
                     sampled_second REAL,
-                    inference_engine TEXT NOT NULL
+                    inference_engine TEXT NOT NULL,
+                    cleared_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS findings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,11 +75,18 @@ class Store:
                 CREATE INDEX IF NOT EXISTS media_location_idx ON media(location_id);
                 """
             )
+            media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
+            if "cleared_at" not in media_columns:
+                db.execute("ALTER TABLE media ADD COLUMN cleared_at TEXT")
 
     def cached_media(self, content_hash: str) -> dict | None:
         with self.connect() as db:
             row = db.execute("SELECT * FROM media WHERE content_hash = ?", (content_hash,)).fetchone()
         return dict(row) if row else None
+
+    def restore_media(self, media_id: int) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE media SET cleared_at = NULL WHERE id = ?", (media_id,))
 
     def insert_media(self, **values) -> int:
         with self.connect() as db:
@@ -122,6 +130,20 @@ class Store:
             )
             return cursor.rowcount == 1
 
+    def clear_all(self) -> dict:
+        """Hide every active result while retaining the no-reprocessing cache."""
+        with self.connect() as db:
+            finding_count = int(db.execute(
+                "SELECT COUNT(*) FROM findings f JOIN media m ON m.id = f.media_id WHERE m.cleared_at IS NULL"
+            ).fetchone()[0])
+            media_count = int(db.execute("SELECT COUNT(*) FROM media WHERE cleared_at IS NULL").fetchone()[0])
+            db.execute("UPDATE media SET cleared_at = ? WHERE cleared_at IS NULL", (utc_now(),))
+        return {
+            "findings_cleared": finding_count,
+            "media_cleared": media_count,
+            "cache_retained": True,
+        }
+
     def findings(self) -> list[dict]:
         with self.connect() as db:
             rows = db.execute(
@@ -129,6 +151,7 @@ class Store:
                 SELECT f.*, m.original_name, m.stored_name, m.location_id, m.width, m.height,
                        m.captured_at, m.source_video, m.sampled_second, m.inference_engine
                 FROM findings f JOIN media m ON m.id = f.media_id
+                WHERE m.cleared_at IS NULL
                 ORDER BY f.created_at DESC, f.id DESC
                 """
             ).fetchall()

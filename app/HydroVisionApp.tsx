@@ -10,7 +10,6 @@ type Finding = {
   severity: Severity;
   affected_area_pct: number;
   bbox: [number, number, number, number];
-  review_status: "unreviewed" | "true_positive" | "false_positive";
   created_at: string;
   captured_at: string;
   location_id: string;
@@ -42,17 +41,21 @@ type Snapshot = {
     monitored_locations: number;
     active_findings: number;
     critical_findings: number;
-    reviewed_pct: number;
   };
 };
 
 const EMPTY: Snapshot = {
   locations: [],
   findings: [],
-  metrics: { monitored_locations: 0, active_findings: 0, critical_findings: 0, reviewed_pct: 0 },
+  metrics: { monitored_locations: 0, active_findings: 0, critical_findings: 0 },
 };
 
-const API = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/$/, "");
+// When opened from another computer, use the HydroVision host's LAN address
+// instead of loopback on the viewing device. An explicit env value still wins.
+const browserApiUrl = typeof window === "undefined"
+  ? "http://127.0.0.1:8001"
+  : `${window.location.protocol}//${window.location.hostname}:8001`;
+const API = (process.env.NEXT_PUBLIC_API_URL || browserApiUrl).replace(/\/$/, "");
 const severityRank: Record<Severity, number> = { normal: 0, observation: 1, warning: 2, critical: 3 };
 
 function mediaUrl(path?: string) {
@@ -79,6 +82,10 @@ export function HydroVisionApp() {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [actionNotice, setActionNotice] = useState("");
+  const [clearOpen, setClearOpen] = useState(false);
+  const [clearBusy, setClearBusy] = useState(false);
+  const [clearError, setClearError] = useState("");
   const [query, setQuery] = useState("");
   const [severityFilter, setSeverityFilter] = useState("all");
 
@@ -102,18 +109,28 @@ export function HydroVisionApp() {
     const term = query.trim().toLowerCase();
     return snapshot.findings.filter((finding) => {
       const matchesSeverity = severityFilter === "all" || finding.severity === severityFilter;
-      const matchesText = !term || `${finding.location_name} ${finding.defect_type} ${finding.review_status}`.toLowerCase().includes(term);
+      const matchesText = !term || `${finding.location_name} ${finding.defect_type}`.toLowerCase().includes(term);
       return matchesSeverity && matchesText;
     });
   }, [query, severityFilter, snapshot.findings]);
 
-  async function review(id: number, status: Finding["review_status"]) {
-    const response = await fetch(`${API}/api/findings/${id}/review`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
-    if (response.ok) setSnapshot(await response.json());
+  async function clearResults() {
+    setClearBusy(true);
+    setClearError("");
+    try {
+      const response = await fetch(`${API}/api/results`, { method: "DELETE" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "Could not clear results");
+      setSnapshot(result.snapshot);
+      setQuery("");
+      setSeverityFilter("all");
+      setActionNotice(`Cleared ${result.findings_cleared} finding${result.findings_cleared === 1 ? "" : "s"}. ${result.media_cleared} image hash${result.media_cleared === 1 ? "" : "es"} retained to prevent repeat inference.`);
+      setClearOpen(false);
+    } catch (error) {
+      setClearError(error instanceof Error ? error.message : "Could not clear results");
+    } finally {
+      setClearBusy(false);
+    }
   }
 
   return (
@@ -155,7 +172,7 @@ export function HydroVisionApp() {
             <div>
               <p className="eyebrow">{activeView === "twin" ? "LIVE ASSET OVERVIEW" : "INSPECTION REGISTER"}</p>
               <h1>{activeView === "twin" ? "Plant condition" : "All findings"}</h1>
-              <p>{activeView === "twin" ? "One synchronized view of visual risk across monitored equipment." : "Review, label and export every detection from one source of truth."}</p>
+              <p>{activeView === "twin" ? "One synchronized view of visual risk across monitored equipment." : "Filter and export every detection from one source of truth."}</p>
             </div>
             <div className="date-block">
               <span>LAST SYNC</span>
@@ -166,13 +183,13 @@ export function HydroVisionApp() {
           <section className="metrics" aria-label="Plant condition summary">
             <Metric value={snapshot.metrics.monitored_locations} label="Locations monitored" detail="6 plant zones" />
             <Metric value={snapshot.metrics.active_findings} label="Active findings" detail={`${snapshot.findings.length} total recorded`} />
-            <Metric value={snapshot.metrics.critical_findings} label="Critical attention" detail="Requires review" urgent={snapshot.metrics.critical_findings > 0} />
-            <Metric value={`${snapshot.metrics.reviewed_pct}%`} label="Evidence reviewed" detail="Human verified" />
+            <Metric value={snapshot.metrics.critical_findings} label="Critical attention" detail="Requires attention" urgent={snapshot.metrics.critical_findings > 0} />
           </section>
 
           {connected === false && (
-            <div className="offline-banner"><strong>Local inspection service is offline.</strong> Start the backend on port 8000 to upload, detect, and review evidence.</div>
+            <div className="offline-banner"><strong>Local inspection service is offline.</strong> Start the backend on port 8001 to upload, detect, and view evidence.</div>
           )}
+          {actionNotice && <div className="action-notice" role="status"><span>{actionNotice}</span><button onClick={() => setActionNotice("")} aria-label="Dismiss message">×</button></div>}
 
           {activeView === "twin" ? (
             <TwinView
@@ -181,7 +198,6 @@ export function HydroVisionApp() {
               selected={selected}
               onSelect={setSelectedLocation}
               onShowFindings={() => setActiveView("findings")}
-              onReview={review}
             />
           ) : (
             <FindingsView
@@ -190,7 +206,7 @@ export function HydroVisionApp() {
               setQuery={setQuery}
               severity={severityFilter}
               setSeverity={setSeverityFilter}
-              onReview={review}
+              onClear={() => { setClearError(""); setClearOpen(true); }}
             />
           )}
         </div>
@@ -224,6 +240,20 @@ export function HydroVisionApp() {
           }}
         />
       )}
+      {clearOpen && (
+        <div className="confirm-backdrop" onMouseDown={() => { if (!clearBusy) setClearOpen(false); }}>
+          <section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="clear-title" aria-describedby="clear-description" onMouseDown={(event) => event.stopPropagation()}>
+            <p className="eyebrow">DESTRUCTIVE ACTION</p>
+            <h2 id="clear-title">Clear all previous results?</h2>
+            <p id="clear-description">This removes every finding from the dashboard and digital twin. Image hashes and local inference results stay cached so duplicate uploads are never processed twice.</p>
+            {clearError && <div className="confirm-error" role="alert">{clearError}</div>}
+            <div className="confirm-actions">
+              <button onClick={() => setClearOpen(false)} disabled={clearBusy}>Keep results</button>
+              <button className="danger-button" onClick={() => void clearResults()} disabled={clearBusy}>{clearBusy ? "Clearing…" : "Clear all results"}</button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -237,13 +267,12 @@ function Metric({ value, label, detail, urgent = false }: { value: string | numb
   );
 }
 
-function TwinView({ locations, findings, selected, onSelect, onShowFindings, onReview }: {
+function TwinView({ locations, findings, selected, onSelect, onShowFindings }: {
   locations: Location[];
   findings: Finding[];
   selected?: Location;
   onSelect: (id: string) => void;
   onShowFindings: () => void;
-  onReview: (id: number, status: Finding["review_status"]) => void;
 }) {
   return (
     <section className="twin-layout">
@@ -287,7 +316,7 @@ function TwinView({ locations, findings, selected, onSelect, onShowFindings, onR
           <button onClick={onShowFindings}>VIEW ALL ↗</button>
         </div>
         <div className="evidence-list">
-          {findings.slice(0, 4).map((finding) => <EvidenceCard key={finding.id} finding={finding} onReview={onReview} />)}
+          {findings.slice(0, 4).map((finding) => <EvidenceCard key={finding.id} finding={finding} />)}
           {!findings.length && <div className="empty-state"><b>No findings yet</b><span>Run an inspection to populate evidence.</span></div>}
         </div>
       </aside>
@@ -295,7 +324,7 @@ function TwinView({ locations, findings, selected, onSelect, onShowFindings, onR
   );
 }
 
-function EvidenceCard({ finding, onReview }: { finding: Finding; onReview: (id: number, status: Finding["review_status"]) => void }) {
+function EvidenceCard({ finding }: { finding: Finding }) {
   const [x1, y1, x2, y2] = finding.bbox;
   const box = { left: `${x1 / finding.width * 100}%`, top: `${y1 / finding.height * 100}%`, width: `${(x2 - x1) / finding.width * 100}%`, height: `${(y2 - y1) / finding.height * 100}%` };
   return (
@@ -308,24 +337,19 @@ function EvidenceCard({ finding, onReview }: { finding: Finding; onReview: (id: 
       <div className="evidence-copy">
         <div><strong>{titleCase(finding.defect_type)}</strong><span>{Math.round(finding.confidence * 100)}% confidence</span></div>
         <p>{finding.location_name} <i /> {relativeDate(finding.created_at)}</p>
-        <div className="review-row">
-          <small>{finding.affected_area_pct}% affected</small>
-          {finding.review_status === "unreviewed" ? (
-            <div><button onClick={() => onReview(finding.id, "true_positive")} aria-label="Confirm true positive">✓</button><button onClick={() => onReview(finding.id, "false_positive")} aria-label="Mark false positive">×</button></div>
-          ) : <span className={`reviewed ${finding.review_status}`}>{finding.review_status === "true_positive" ? "Confirmed" : "Dismissed"}</span>}
-        </div>
+        <small className="evidence-area">{finding.affected_area_pct}% affected area</small>
       </div>
     </article>
   );
 }
 
-function FindingsView({ findings, query, setQuery, severity, setSeverity, onReview }: {
+function FindingsView({ findings, query, setQuery, severity, setSeverity, onClear }: {
   findings: Finding[];
   query: string;
   setQuery: (value: string) => void;
   severity: string;
   setSeverity: (value: string) => void;
-  onReview: (id: number, status: Finding["review_status"]) => void;
+  onClear: () => void;
 }) {
   return (
     <section className="findings-card">
@@ -335,10 +359,11 @@ function FindingsView({ findings, query, setQuery, severity, setSeverity, onRevi
           {["all", "critical", "warning", "observation"].map((item) => <button key={item} className={severity === item ? "active" : ""} onClick={() => setSeverity(item)}>{titleCase(item)}</button>)}
         </div>
         <span className="result-count">{findings.length} RESULTS</span>
+        <button className="clear-results-button" onClick={onClear}>Clear results</button>
       </div>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>Evidence</th><th>Location</th><th>Detection</th><th>Confidence</th><th>Severity</th><th>Captured</th><th>Review</th></tr></thead>
+          <thead><tr><th>Evidence</th><th>Location</th><th>Detection</th><th>Confidence</th><th>Severity</th><th>Captured</th></tr></thead>
           <tbody>
             {findings.map((finding) => (
               <tr key={finding.id}>
@@ -348,9 +373,6 @@ function FindingsView({ findings, query, setQuery, severity, setSeverity, onRevi
                 <td><span className="confidence"><i style={{ width: `${finding.confidence * 100}%` }} /></span><b>{Math.round(finding.confidence * 100)}%</b></td>
                 <td><span className={`severity-tag ${finding.severity}`}>{finding.severity}</span></td>
                 <td><strong>{relativeDate(finding.created_at)}</strong><small>{finding.source_video ? `Frame · ${finding.sampled_second}s` : "Image"}</small></td>
-                <td>
-                  {finding.review_status === "unreviewed" ? <div className="table-actions"><button onClick={() => onReview(finding.id, "true_positive")}>Confirm</button><button onClick={() => onReview(finding.id, "false_positive")}>Dismiss</button></div> : <span className={`reviewed ${finding.review_status}`}>{titleCase(finding.review_status)}</span>}
-                </td>
               </tr>
             ))}
           </tbody>

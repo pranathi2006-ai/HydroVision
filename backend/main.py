@@ -44,12 +44,21 @@ allowed_origins.update(
     if origin.strip()
 )
 
+# Allow browser clients served from this machine over private Wi-Fi/LAN
+# addresses while avoiding a blanket public-origin CORS policy.
+LAN_ORIGIN_REGEX = (
+    r"^http://(?:localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|"
+    r"192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|"
+    r"169\.254(?:\.\d{1,3}){2}|[A-Za-z0-9-]+\.local)(?::\d{1,5})?$"
+)
+
 app = FastAPI(title="HydroVision local inspection API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(allowed_origins),
+    allow_origin_regex=LAN_ORIGIN_REGEX,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -107,6 +116,7 @@ def persist_image(
     content_hash = hashlib.sha256(raw).hexdigest()
     cached = store.cached_media(content_hash)
     if cached:
+        store.restore_media(cached["id"])
         return {"cached": True, "media_id": cached["id"], "hash": content_hash}, None, None
 
     jpeg, image, width, height = normalize_image(raw)
@@ -162,7 +172,8 @@ def seed_demo_data() -> None:
         )
 
 
-seed_demo_data()
+if os.getenv("HYDROVISION_SEED_DEMO", "").lower() in {"1", "true", "yes"}:
+    seed_demo_data()
 
 
 def sample_video(path: Path, original_name: str, location_id: str) -> tuple[list[dict], list[tuple[np.ndarray, int]]]:
@@ -282,6 +293,15 @@ def review_finding(finding_id: int, request: ReviewRequest) -> dict:
     if not store.review(finding_id, request.status):
         raise HTTPException(status_code=404, detail="Finding not found.")
     return store.snapshot()
+
+
+@app.delete("/api/results")
+def clear_results() -> dict:
+    cleared = store.clear_all()
+    return {
+        **cleared,
+        "snapshot": store.snapshot(),
+    }
 
 
 @app.get("/api/media/{stored_name}")

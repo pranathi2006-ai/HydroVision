@@ -27,7 +27,11 @@ class LocalDetector:
 
     def __init__(self, model_path: str | None = None) -> None:
         self.model = None
+        repository_root = Path(__file__).resolve().parents[1]
+        default_model = repository_root / "models" / "hydrovision-yolov8n.pt"
         configured = model_path or os.getenv("HYDROVISION_MODEL_PATH")
+        if not configured and default_model.is_file():
+            configured = str(default_model)
         if configured and Path(configured).is_file():
             from ultralytics import YOLO
 
@@ -62,7 +66,9 @@ class LocalDetector:
             for box in result.boxes:
                 x1, y1, x2, y2 = (int(value) for value in box.xyxy[0].tolist())
                 raw_name = str(result.names[int(box.cls[0])]).lower()
-                defect_type = "corrosion" if "rust" in raw_name or "corrosion" in raw_name else "leak"
+                defect_type = self._canonical_defect_type(raw_name)
+                if defect_type is None:
+                    continue
                 area = max(0, x2 - x1) * max(0, y2 - y1)
                 detections.append(
                     Detection(
@@ -74,6 +80,15 @@ class LocalDetector:
                 )
             output.append(detections)
         return output
+
+    @staticmethod
+    def _canonical_defect_type(raw_name: str) -> str | None:
+        normalized = raw_name.lower().replace("-", "_").replace(" ", "_")
+        if "corrosion" in normalized or "rust" in normalized:
+            return "corrosion"
+        if "leak" in normalized and ("oil" in normalized or normalized == "leak"):
+            return "leak"
+        return None
 
     def _predict_baseline(self, image: np.ndarray) -> list[Detection]:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)

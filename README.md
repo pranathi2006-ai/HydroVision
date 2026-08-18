@@ -31,7 +31,12 @@ python3 -m pip install -r backend/requirements.txt
 ```
 
 The web app runs at `http://localhost:3000`; the local API and documentation
-run at `http://localhost:8000` and `http://localhost:8000/docs`.
+run at `http://localhost:8001` and `http://localhost:8001/docs`.
+
+Both services listen on the local network. To open HydroVision from another
+computer on the same Wi-Fi, find this machine's private IPv4 address and open
+`http://<private-ip>:3000`. Keep the terminal running, and allow incoming
+connections if the operating-system firewall asks.
 
 To run the two processes separately:
 
@@ -42,16 +47,20 @@ npm run backend
 
 ## Model weights
 
-Export a YOLO model whose class names contain `rust`/`corrosion` and
-`leak`/`oil`/`water`, then point the backend at it:
+The repository includes reproducible acquisition, label normalization,
+training, and evaluation commands for a two-class YOLOv8n detector. See
+[`training/README.md`](training/README.md). The backend automatically loads
+`models/hydrovision-yolov8n.pt` after training, or you can point it at another
+compatible model:
 
 ```bash
 export HYDROVISION_MODEL_PATH=/absolute/path/to/best.pt
 npm run backend
 ```
 
-The model is loaded from disk and forced to CPU-local inference with a maximum
-image size of 1024px. The repository does not silently download generic weights.
+Inference is local and forced to CPU with a maximum image size of 1024px. Model
+training downloads the selected public data and pretrained weights only when
+you explicitly run the training commands.
 
 ## Verification
 
@@ -64,5 +73,5 @@ The Python tests cover resize enforcement, 30-second video sampling, and a
 known corrosion patch with an expected bounding box and confidence. `npm test`
 builds the web app and checks the server-rendered product shell.
 
-Local evidence, cache rows, and review labels live under `data/`. CSV export is
+Local evidence and cache rows live under `data/`. CSV export is
 available from the app header or at `/api/export.csv`.
