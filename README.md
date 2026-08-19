@@ -5,6 +5,10 @@ hydropower equipment. It accepts images or video, detects corrosion and leaks,
 and keeps the plant map and findings register synchronized through one SQLite
 snapshot.
 
+Phase 1 operational data plumbing also records generation output, headwater,
+tailwater, and gate position through a pluggable source adapter. It performs no
+theoretical calculations, gap calculations, LLM calls, or VLM calls.
+
 ## What is enforced
 
 - Inference runs locally. Set `HYDROVISION_MODEL_PATH` to fine-tuned YOLO
@@ -75,3 +79,33 @@ builds the web app and checks the server-rendered product shell.
 
 Local evidence and cache rows live under `data/`. CSV export is
 available from the app header or at `/api/export.csv`.
+
+## Operational reading source
+
+The default `MockSourceAdapter` emits smooth, plausible readings every five
+minutes. The verification page's **Readings** section fetches the same raw rows
+on a minutes-scale interval. To switch the entire ingestion path to the plant
+source, change one setting:
+
+```bash
+export HYDROVISION_PERFORMANCE_SOURCE=real
+```
+
+Before doing that, copy the `HYDROVISION_PLANT_*` connection stub from
+`.env.example` and confirm the endpoint, credentials, JSON field names, source
+update interval, units, and physical validation limits with the controls team.
+`RealSourceAdapter` currently implements a JSON/HTTP transport; if the confirmed
+interface is OPC-UA or a historian SDK, replace only that adapter's transport
+body and retain its `getLatestReading()` return contract.
+
+The canonical PostgreSQL DDL is in
+`backend/migrations/001_performance_reading.sql`. Local development creates the
+same columns in SQLite automatically; `theoretical_mw` and `gap_pct` remain
+`NULL` until Phase 2.
+
+After the service has run continuously for a day, verify the operational exit
+criterion with:
+
+```bash
+python3 scripts/check_performance_soak.py --hours 24 --interval-seconds 300
+```

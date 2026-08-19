@@ -5,7 +5,10 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    from .performance import PerformanceReading
 
 
 LOCATIONS = [
@@ -73,6 +76,18 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS findings_created_idx ON findings(created_at DESC);
                 CREATE INDEX IF NOT EXISTS media_location_idx ON media(location_id);
+                CREATE TABLE IF NOT EXISTS performance_reading (
+                    reading_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    headwater_level REAL,
+                    tailwater_level REAL,
+                    gate_position REAL,
+                    theoretical_mw REAL,
+                    actual_mw REAL,
+                    gap_pct REAL
+                );
+                CREATE INDEX IF NOT EXISTS performance_reading_ts_idx
+                    ON performance_reading(ts);
                 """
             )
             media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
@@ -87,6 +102,48 @@ class Store:
     def restore_media(self, media_id: int) -> None:
         with self.connect() as db:
             db.execute("UPDATE media SET cleared_at = NULL WHERE id = ?", (media_id,))
+
+    def insert_performance_reading(self, reading: "PerformanceReading") -> int:
+        assert reading.ts is not None
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO performance_reading (
+                    ts, headwater_level, tailwater_level, gate_position,
+                    theoretical_mw, actual_mw, gap_pct
+                ) VALUES (?, ?, ?, ?, NULL, ?, NULL)
+                """,
+                (
+                    reading.ts.astimezone(timezone.utc).isoformat(),
+                    reading.headwater_level,
+                    reading.tailwater_level,
+                    reading.gate_position,
+                    reading.actual_mw,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def latest_performance_timestamp(self) -> datetime | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT ts FROM performance_reading ORDER BY ts DESC, reading_id DESC LIMIT 1"
+            ).fetchone()
+        return datetime.fromisoformat(row["ts"]).astimezone(timezone.utc) if row else None
+
+    def performance_readings_since(self, since: datetime) -> list[dict]:
+        since_utc = since.astimezone(timezone.utc).isoformat()
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT reading_id, ts, headwater_level, tailwater_level,
+                       gate_position, theoretical_mw, actual_mw, gap_pct
+                FROM performance_reading
+                WHERE ts >= ?
+                ORDER BY ts ASC, reading_id ASC
+                """,
+                (since_utc,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def insert_media(self, **values) -> int:
         with self.connect() as db:

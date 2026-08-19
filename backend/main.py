@@ -5,17 +5,21 @@ import hashlib
 import io
 import os
 import re
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image, ImageDraw, ImageOps
 from pydantic import BaseModel
 
 from .detector import Detection, LocalDetector
+from .performance import PerformanceIngestionService, PerformanceSettings, build_adapter
 from .store import LOCATIONS, Store
 
 
@@ -32,6 +36,12 @@ ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-ms
 
 store = Store(DATA_DIR / "hydrovision.sqlite3")
 detector = LocalDetector()
+performance_settings = PerformanceSettings.from_env()
+performance_ingestion = PerformanceIngestionService(
+    store,
+    build_adapter(performance_settings),
+    performance_settings,
+)
 
 allowed_origins = {
     "http://localhost:3000",
@@ -52,7 +62,16 @@ LAN_ORIGIN_REGEX = (
     r"169\.254(?:\.\d{1,3}){2}|[A-Za-z0-9-]+\.local)(?::\d{1,5})?$"
 )
 
-app = FastAPI(title="HydroVision local inspection API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    performance_ingestion.start()
+    try:
+        yield
+    finally:
+        await performance_ingestion.stop()
+
+
+app = FastAPI(title="HydroVision local inspection API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(allowed_origins),
@@ -216,7 +235,22 @@ def health() -> dict:
         "engine": detector.engine_name,
         "max_long_edge": MAX_LONG_EDGE,
         "video_sample_seconds": VIDEO_SAMPLE_SECONDS,
+        "performance_source": performance_settings.source,
+        "performance_poll_interval_seconds": performance_settings.effective_interval_seconds,
     }
+
+
+@app.get("/api/performance/readings")
+def performance_readings(
+    response: Response,
+    since: datetime = Query(..., description="Timezone-aware ISO-8601 lower bound"),
+) -> list[dict]:
+    if since.tzinfo is None:
+        raise HTTPException(status_code=422, detail="since must include a timezone offset")
+    response.headers["X-Poll-Interval-Seconds"] = str(
+        performance_settings.effective_interval_seconds
+    )
+    return store.performance_readings_since(since.astimezone(timezone.utc))
 
 
 @app.get("/api/snapshot")

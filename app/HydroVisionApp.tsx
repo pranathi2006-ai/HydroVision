@@ -44,6 +44,19 @@ type Snapshot = {
   };
 };
 
+type PerformanceReading = {
+  reading_id: number;
+  ts: string;
+  headwater_level: number;
+  tailwater_level: number;
+  gate_position: number;
+  theoretical_mw: null;
+  actual_mw: number;
+  gap_pct: null;
+};
+
+type View = "twin" | "findings" | "performance";
+
 const EMPTY: Snapshot = {
   locations: [],
   findings: [],
@@ -56,8 +69,10 @@ const browserApiUrl = typeof window === "undefined"
   ? "http://127.0.0.1:8001"
   : `${window.location.protocol}//${window.location.hostname}:8001`;
 const API = (process.env.NEXT_PUBLIC_API_URL || browserApiUrl).replace(/\/$/, "");
-const severityRank: Record<Severity, number> = { normal: 0, observation: 1, warning: 2, critical: 3 };
-
+const configuredPerformancePollSeconds = Number(process.env.NEXT_PUBLIC_PERFORMANCE_POLL_SECONDS || 300);
+const INITIAL_PERFORMANCE_POLL_SECONDS = Number.isFinite(configuredPerformancePollSeconds)
+  ? Math.max(60, configuredPerformancePollSeconds)
+  : 300;
 function mediaUrl(path?: string) {
   return path ? `${API}${path}` : "";
 }
@@ -76,7 +91,10 @@ function titleCase(value: string) {
 
 export function HydroVisionApp() {
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY);
-  const [activeView, setActiveView] = useState<"twin" | "findings">("twin");
+  const [activeView, setActiveView] = useState<View>("twin");
+  const [performanceReadings, setPerformanceReadings] = useState<PerformanceReading[]>([]);
+  const [performanceConnected, setPerformanceConnected] = useState<boolean | null>(null);
+  const [performancePollSeconds, setPerformancePollSeconds] = useState(INITIAL_PERFORMANCE_POLL_SECONDS);
   const [selectedLocation, setSelectedLocation] = useState<string>("turbine-a");
   const [uploadOpen, setUploadOpen] = useState(false);
   const [connected, setConnected] = useState<boolean | null>(null);
@@ -89,20 +107,45 @@ export function HydroVisionApp() {
   const [query, setQuery] = useState("");
   const [severityFilter, setSeverityFilter] = useState("all");
 
-  async function loadSnapshot() {
-    try {
-      const response = await fetch(`${API}/api/snapshot`);
-      if (!response.ok) throw new Error("Service unavailable");
-      setSnapshot(await response.json());
-      setConnected(true);
-    } catch {
-      setConnected(false);
-    }
-  }
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${API}/api/snapshot`)
+      .then((response) => {
+        if (!response.ok) throw new Error("Service unavailable");
+        return response.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        setSnapshot(data);
+        setConnected(true);
+      })
+      .catch(() => {
+        if (!cancelled) setConnected(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
-    void loadSnapshot();
-  }, []);
+    async function loadReadings() {
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      try {
+        const response = await fetch(`${API}/api/performance/readings?since=${encodeURIComponent(since)}`);
+        if (!response.ok) throw new Error("Performance service unavailable");
+        setPerformanceReadings(await response.json());
+        const sourceInterval = Number(response.headers.get("X-Poll-Interval-Seconds"));
+        if (Number.isFinite(sourceInterval) && sourceInterval > 0) {
+          setPerformancePollSeconds(Math.max(60, sourceInterval));
+        }
+        setPerformanceConnected(true);
+      } catch {
+        setPerformanceConnected(false);
+      }
+    }
+
+    void loadReadings();
+    const timer = window.setInterval(() => void loadReadings(), performancePollSeconds * 1000);
+    return () => window.clearInterval(timer);
+  }, [performancePollSeconds]);
 
   const selected = snapshot.locations.find((item) => item.id === selectedLocation) ?? snapshot.locations[0];
   const filteredFindings = useMemo(() => {
@@ -113,6 +156,11 @@ export function HydroVisionApp() {
       return matchesSeverity && matchesText;
     });
   }, [query, severityFilter, snapshot.findings]);
+  const viewCopy = activeView === "twin"
+    ? ["LIVE ASSET OVERVIEW", "Plant condition", "One synchronized view of visual risk across monitored equipment."]
+    : activeView === "findings"
+      ? ["INSPECTION REGISTER", "All findings", "Filter and export every detection from one source of truth."]
+      : ["PHASE 1 · RAW DATA", "Operational readings", "Four source readings, stored as received with no calculations or aggregation."];
 
   async function clearResults() {
     setClearBusy(true);
@@ -147,6 +195,9 @@ export function HydroVisionApp() {
           <button className={activeView === "findings" ? "active" : ""} onClick={() => setActiveView("findings")} aria-label="Findings">
             <span className="nav-icon list-icon"><i /><i /><i /></span><small>Findings</small>
           </button>
+          <button className={activeView === "performance" ? "active" : ""} onClick={() => setActiveView("performance")} aria-label="Operational readings">
+            <span className="nav-icon signal-icon"><i /><i /><i /><i /></span><small>Readings</small>
+          </button>
         </nav>
         <div className="rail-bottom">
           <span className={`connection-dot ${connected ? "online" : ""}`} />
@@ -170,24 +221,26 @@ export function HydroVisionApp() {
         <div className="content">
           <section className="page-heading">
             <div>
-              <p className="eyebrow">{activeView === "twin" ? "LIVE ASSET OVERVIEW" : "INSPECTION REGISTER"}</p>
-              <h1>{activeView === "twin" ? "Plant condition" : "All findings"}</h1>
-              <p>{activeView === "twin" ? "One synchronized view of visual risk across monitored equipment." : "Filter and export every detection from one source of truth."}</p>
+              <p className="eyebrow">{viewCopy[0]}</p>
+              <h1>{viewCopy[1]}</h1>
+              <p>{viewCopy[2]}</p>
             </div>
             <div className="date-block">
               <span>LAST SYNC</span>
-              <strong>{connected ? "NOW" : "WAITING"}</strong>
+              <strong>{(activeView === "performance" ? performanceConnected : connected) ? "NOW" : "WAITING"}</strong>
             </div>
           </section>
 
-          <section className="metrics" aria-label="Plant condition summary">
-            <Metric value={snapshot.metrics.monitored_locations} label="Locations monitored" detail="6 plant zones" />
-            <Metric value={snapshot.metrics.active_findings} label="Active findings" detail={`${snapshot.findings.length} total recorded`} />
-            <Metric value={snapshot.metrics.critical_findings} label="Critical attention" detail="Requires attention" urgent={snapshot.metrics.critical_findings > 0} />
-          </section>
+          {activeView !== "performance" && (
+            <section className="metrics" aria-label="Plant condition summary">
+              <Metric value={snapshot.metrics.monitored_locations} label="Locations monitored" detail="6 plant zones" />
+              <Metric value={snapshot.metrics.active_findings} label="Active findings" detail={`${snapshot.findings.length} total recorded`} />
+              <Metric value={snapshot.metrics.critical_findings} label="Critical attention" detail="Requires attention" urgent={snapshot.metrics.critical_findings > 0} />
+            </section>
+          )}
 
-          {connected === false && (
-            <div className="offline-banner"><strong>Local inspection service is offline.</strong> Start the backend on port 8001 to upload, detect, and view evidence.</div>
+          {(activeView === "performance" ? performanceConnected : connected) === false && (
+            <div className="offline-banner"><strong>Local service is offline.</strong> Start the backend on port 8001 to view live plant data.</div>
           )}
           {actionNotice && <div className="action-notice" role="status"><span>{actionNotice}</span><button onClick={() => setActionNotice("")} aria-label="Dismiss message">×</button></div>}
 
@@ -199,7 +252,7 @@ export function HydroVisionApp() {
               onSelect={setSelectedLocation}
               onShowFindings={() => setActiveView("findings")}
             />
-          ) : (
+          ) : activeView === "findings" ? (
             <FindingsView
               findings={filteredFindings}
               query={query}
@@ -208,6 +261,8 @@ export function HydroVisionApp() {
               setSeverity={setSeverityFilter}
               onClear={() => { setClearError(""); setClearOpen(true); }}
             />
+          ) : (
+            <PerformanceView readings={performanceReadings} pollSeconds={performancePollSeconds} />
           )}
         </div>
       </section>
@@ -377,6 +432,50 @@ function FindingsView({ findings, query, setQuery, severity, setSeverity, onClea
             ))}
           </tbody>
         </table>
+      </div>
+    </section>
+  );
+}
+
+function formatReading(value: number | null, digits: number) {
+  return value == null ? "—" : value.toFixed(digits);
+}
+
+function PerformanceView({ readings, pollSeconds }: { readings: PerformanceReading[]; pollSeconds: number }) {
+  const latest = readings.at(-1);
+  const newestFirst = readings.slice().reverse();
+  const cadenceMinutes = Math.max(1, Math.round(pollSeconds / 60));
+
+  return (
+    <section className="performance-view">
+      <div className="performance-metrics" aria-label="Latest operational reading">
+        <Metric value={formatReading(latest?.actual_mw ?? null, 2)} label="Generation output" detail="MW · actual" />
+        <Metric value={formatReading(latest?.headwater_level ?? null, 3)} label="Headwater level" detail="m" />
+        <Metric value={formatReading(latest?.tailwater_level ?? null, 3)} label="Tailwater level" detail="m" />
+        <Metric value={formatReading(latest?.gate_position ?? null, 2)} label="Gate position" detail="% open" />
+      </div>
+      <div className="performance-card">
+        <div className="section-bar">
+          <div><span className="section-index">01</span><strong>Raw reading log · last 24 hours</strong></div>
+          <span className="poll-cadence">REFRESHES EVERY {cadenceMinutes} MIN</span>
+        </div>
+        <div className="table-wrap">
+          <table className="performance-table">
+            <thead><tr><th>Timestamp</th><th>Generation output</th><th>Headwater</th><th>Tailwater</th><th>Gate position</th></tr></thead>
+            <tbody>
+              {newestFirst.map((reading) => (
+                <tr key={reading.reading_id}>
+                  <td><strong>{new Date(reading.ts).toLocaleString()}</strong><small>{relativeDate(reading.ts)}</small></td>
+                  <td><b>{formatReading(reading.actual_mw, 3)}</b><small>MW</small></td>
+                  <td><b>{formatReading(reading.headwater_level, 3)}</b><small>m</small></td>
+                  <td><b>{formatReading(reading.tailwater_level, 3)}</b><small>m</small></td>
+                  <td><b>{formatReading(reading.gate_position, 2)}</b><small>% open</small></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!readings.length && <div className="performance-empty"><b>Waiting for the first reading</b><span>The active source is polled on the configured minutes-scale interval.</span></div>}
+        </div>
       </div>
     </section>
   );
