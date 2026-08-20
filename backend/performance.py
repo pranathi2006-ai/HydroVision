@@ -8,7 +8,7 @@ import os
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .reference_curves import PerformanceCalculationError, PerformanceCalculationService
 from .store import Store
@@ -206,11 +206,13 @@ class PerformanceIngestionService:
         adapter: SourceAdapter,
         settings: PerformanceSettings,
         calculator: PerformanceCalculationService,
+        on_reading_stored: Callable[[int], None] | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
         self.settings = settings
         self.calculator = calculator
+        self.on_reading_stored = on_reading_stored
         self._task: asyncio.Task[None] | None = None
         self._warned_gap_after: datetime | None = None
 
@@ -305,6 +307,13 @@ class PerformanceIngestionService:
             reading.gate_position,
             type(self.adapter).__name__,
         )
+        if self.on_reading_stored is not None:
+            try:
+                self.on_reading_stored(reading_id)
+            except Exception:
+                # Attribution is downstream of a valid Phase 1/2 reading. Its
+                # failure must be visible without rolling back source ingestion.
+                logger.exception("post-ingestion attribution failed reading_id=%s", reading_id)
         return True
 
     async def _run(self) -> None:

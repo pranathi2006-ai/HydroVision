@@ -55,6 +55,19 @@ type PerformanceReading = {
   gap_pct: number | null;
 };
 
+type LossAttribution = {
+  attribution_id: number;
+  reading_id: number;
+  rank: number;
+  asset_id: string;
+  asset_name: string;
+  event_id: number;
+  detection_type: string;
+  estimated_loss_mw: number;
+  confidence: number;
+  method: "rule_based";
+};
+
 type View = "twin" | "findings" | "performance";
 
 const EMPTY: Snapshot = {
@@ -95,6 +108,9 @@ export function HydroVisionApp() {
   const [performanceReadings, setPerformanceReadings] = useState<PerformanceReading[]>([]);
   const [performanceConnected, setPerformanceConnected] = useState<boolean | null>(null);
   const [performancePollSeconds, setPerformancePollSeconds] = useState(INITIAL_PERFORMANCE_POLL_SECONDS);
+  const [attributionThreshold, setAttributionThreshold] = useState(5);
+  const [attributionEnabled, setAttributionEnabled] = useState(true);
+  const [lossAttributions, setLossAttributions] = useState<Record<number, LossAttribution[]>>({});
   const [selectedLocation, setSelectedLocation] = useState<string>("turbine-a");
   const [uploadOpen, setUploadOpen] = useState(false);
   const [connected, setConnected] = useState<boolean | null>(null);
@@ -131,11 +147,27 @@ export function HydroVisionApp() {
       try {
         const response = await fetch(`${API}/api/performance/readings?since=${encodeURIComponent(since)}`);
         if (!response.ok) throw new Error("Performance service unavailable");
-        setPerformanceReadings(await response.json());
+        const readings: PerformanceReading[] = await response.json();
+        setPerformanceReadings(readings);
         const sourceInterval = Number(response.headers.get("X-Poll-Interval-Seconds"));
         if (Number.isFinite(sourceInterval) && sourceInterval > 0) {
           setPerformancePollSeconds(Math.max(60, sourceInterval));
         }
+        const thresholdHeader = Number(response.headers.get("X-Attribution-Threshold-Pct"));
+        const threshold = Number.isFinite(thresholdHeader) ? thresholdHeader : 5;
+        if (Number.isFinite(thresholdHeader)) setAttributionThreshold(thresholdHeader);
+        setAttributionEnabled(response.headers.get("X-Attribution-Enabled") !== "false");
+        const triggering = readings.filter((reading) => reading.gap_pct != null && reading.gap_pct > threshold);
+        const ranked = await Promise.all(triggering.map(async (reading) => {
+          try {
+            const attributionResponse = await fetch(`${API}/api/performance/attribution?reading_id=${reading.reading_id}`);
+            if (!attributionResponse.ok) return [reading.reading_id, []] as const;
+            return [reading.reading_id, await attributionResponse.json() as LossAttribution[]] as const;
+          } catch {
+            return [reading.reading_id, []] as const;
+          }
+        }));
+        setLossAttributions(Object.fromEntries(ranked));
         setPerformanceConnected(true);
       } catch {
         setPerformanceConnected(false);
@@ -160,7 +192,7 @@ export function HydroVisionApp() {
     ? ["LIVE ASSET OVERVIEW", "Plant condition", "One synchronized view of visual risk across monitored equipment."]
     : activeView === "findings"
       ? ["INSPECTION REGISTER", "All findings", "Filter and export every detection from one source of truth."]
-      : ["PHASE 1 · RAW DATA", "Operational readings", "Four source readings, stored as received with no calculations or aggregation."];
+      : ["PHASE 4 · RULE ATTRIBUTION", "Operational performance", "Raw readings, healthy-output comparison, and evidence-linked likely contributors."];
 
   async function clearResults() {
     setClearBusy(true);
@@ -262,7 +294,13 @@ export function HydroVisionApp() {
               onClear={() => { setClearError(""); setClearOpen(true); }}
             />
           ) : (
-            <PerformanceView readings={performanceReadings} pollSeconds={performancePollSeconds} />
+            <PerformanceView
+              readings={performanceReadings}
+              pollSeconds={performancePollSeconds}
+              attributionThreshold={attributionThreshold}
+              attributionEnabled={attributionEnabled}
+              attributions={lossAttributions}
+            />
           )}
         </div>
       </section>
@@ -441,7 +479,13 @@ function formatReading(value: number | null, digits: number) {
   return value == null ? "—" : value.toFixed(digits);
 }
 
-function PerformanceView({ readings, pollSeconds }: { readings: PerformanceReading[]; pollSeconds: number }) {
+function PerformanceView({ readings, pollSeconds, attributionThreshold, attributionEnabled, attributions }: {
+  readings: PerformanceReading[];
+  pollSeconds: number;
+  attributionThreshold: number;
+  attributionEnabled: boolean;
+  attributions: Record<number, LossAttribution[]>;
+}) {
   const latest = readings.at(-1);
   const newestFirst = readings.slice().reverse();
   const cadenceMinutes = Math.max(1, Math.round(pollSeconds / 60));
@@ -462,7 +506,7 @@ function PerformanceView({ readings, pollSeconds }: { readings: PerformanceReadi
         </div>
         <div className="table-wrap">
           <table className="performance-table">
-            <thead><tr><th>Timestamp</th><th>Actual</th><th>Theoretical</th><th>Gap</th><th>Headwater</th><th>Tailwater</th><th>Gate position</th></tr></thead>
+            <thead><tr><th>Timestamp</th><th>Actual</th><th>Theoretical</th><th>Gap</th><th>Likely contributors</th><th>Headwater</th><th>Tailwater</th><th>Gate position</th></tr></thead>
             <tbody>
               {newestFirst.map((reading) => (
                 <tr key={reading.reading_id}>
@@ -470,6 +514,11 @@ function PerformanceView({ readings, pollSeconds }: { readings: PerformanceReadi
                   <td><b>{formatReading(reading.actual_mw, 3)}</b><small>MW</small></td>
                   <td><b>{formatReading(reading.theoretical_mw, 3)}</b><small>MW</small></td>
                   <td><b>{formatReading(reading.gap_pct, 2)}</b><small>%</small></td>
+                  <td>
+                    {reading.gap_pct != null && reading.gap_pct > attributionThreshold ? (
+                      <AttributionRanking items={attributions[reading.reading_id]} enabled={attributionEnabled} />
+                    ) : <span className="attribution-not-triggered">Below {attributionThreshold}% trigger</span>}
+                  </td>
                   <td><b>{formatReading(reading.headwater_level, 3)}</b><small>m</small></td>
                   <td><b>{formatReading(reading.tailwater_level, 3)}</b><small>m</small></td>
                   <td><b>{formatReading(reading.gate_position, 2)}</b><small>% open</small></td>
@@ -481,6 +530,28 @@ function PerformanceView({ readings, pollSeconds }: { readings: PerformanceReadi
         </div>
       </div>
     </section>
+  );
+}
+
+function AttributionRanking({ items, enabled }: { items?: LossAttribution[]; enabled: boolean }) {
+  if (!enabled) {
+    return <span className="attribution-unexplained">Disabled · confirm generator-terminal meter</span>;
+  }
+  if (items === undefined) {
+    return <span className="attribution-not-triggered">Checking recent evidence…</span>;
+  }
+  if (!items.length) {
+    return <span className="attribution-unexplained">Unexplained · no recent active evidence</span>;
+  }
+  return (
+    <ol className="attribution-ranking" aria-label="Ranked loss attribution">
+      {items.map((item) => (
+        <li key={item.attribution_id}>
+          <b>{item.rank}</b>
+          <span><strong>{item.asset_name}</strong><small>{item.estimated_loss_mw.toFixed(2)} MW · {Math.round(item.confidence * 100)}% confidence</small></span>
+        </li>
+      ))}
+    </ol>
   );
 }
 

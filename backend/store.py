@@ -40,6 +40,80 @@ SITE_SENSORS = [
     ("draft_tube_camera", "draft_tube", "camera"),
 ]
 
+ATTRIBUTION_RULES = [
+    {
+        "rule_id": "trash_rack_blockage",
+        "defect_type": "trash_rack_blockage",
+        "formula_type": "geometric",
+        "params": {
+            "operation": "rack_head_loss",
+            "asset_ids": ["intake_gate"],
+            "rack_open_area_m2": 22.0,
+            "loss_coefficient": 1.15,
+            "maximum_blockage_fraction": 0.85,
+        },
+        "confidence": 0.9,
+    },
+    {
+        "rule_id": "gate_position_mismatch",
+        "defect_type": "gate_position_mismatch",
+        "formula_type": "geometric",
+        "params": {
+            "operation": "visual_gate_flow",
+            "asset_ids": ["intake_gate"],
+        },
+        "confidence": 0.88,
+    },
+    {
+        "rule_id": "oil_leak",
+        "defect_type": "oil_leak",
+        "formula_type": "heuristic_map",
+        "params": {
+            "operation": "flow_loss_pct",
+            "asset_ids": ["penstock_valve"],
+            "severity_map": {"observation": 0.25, "warning": 1.0, "critical": 2.5},
+            "scale_by_event_confidence": True,
+        },
+        "confidence": 0.52,
+    },
+    {
+        "rule_id": "cavitation_wear",
+        "defect_type": "cavitation_wear",
+        "formula_type": "heuristic_map",
+        "params": {
+            "operation": "efficiency_loss_pct",
+            "asset_ids": ["turbine_1", "turbine_2"],
+            "severity_map": {"observation": 0.4, "warning": 1.5, "critical": 4.0},
+            "scale_by_event_confidence": True,
+        },
+        "confidence": 0.55,
+    },
+    {
+        "rule_id": "draft_tube_blockage",
+        "defect_type": "draft_tube_blockage",
+        "formula_type": "heuristic_map",
+        "params": {
+            "operation": "head_reduction_m",
+            "asset_ids": ["draft_tube"],
+            "severity_map": {"observation": 0.08, "warning": 0.35, "critical": 0.9},
+            "scale_by_event_confidence": True,
+        },
+        "confidence": 0.58,
+    },
+    {
+        "rule_id": "draft_tube_damage",
+        "defect_type": "corrosion",
+        "formula_type": "heuristic_map",
+        "params": {
+            "operation": "head_reduction_m",
+            "asset_ids": ["draft_tube"],
+            "severity_map": {"observation": 0.05, "warning": 0.2, "critical": 0.55},
+            "scale_by_event_confidence": True,
+        },
+        "confidence": 0.48,
+    },
+]
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -191,6 +265,35 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS detection_event_asset_ts_idx
                     ON detection_event(asset_id, ts DESC);
+                CREATE TABLE IF NOT EXISTS attribution_rule_config (
+                    rule_id TEXT PRIMARY KEY,
+                    defect_type TEXT NOT NULL,
+                    formula_type TEXT NOT NULL CHECK (formula_type IN ('geometric','heuristic_map')),
+                    params TEXT NOT NULL,
+                    confidence REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS loss_attribution (
+                    attribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reading_id INTEGER NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    event_id INTEGER NOT NULL,
+                    estimated_loss_mw REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    method TEXT NOT NULL,
+                    FOREIGN KEY (reading_id) REFERENCES performance_reading(reading_id),
+                    FOREIGN KEY (asset_id) REFERENCES asset(asset_id),
+                    FOREIGN KEY (event_id) REFERENCES detection_event(event_id),
+                    UNIQUE (reading_id, event_id)
+                );
+                CREATE TABLE IF NOT EXISTS attribution_run (
+                    reading_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL CHECK (status IN ('attributed','unexplained')),
+                    threshold_pct REAL NOT NULL,
+                    processed_at TEXT NOT NULL,
+                    FOREIGN KEY (reading_id) REFERENCES performance_reading(reading_id)
+                );
+                CREATE INDEX IF NOT EXISTS loss_attribution_reading_rank_idx
+                    ON loss_attribution(reading_id, estimated_loss_mw DESC);
                 """
             )
             media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
@@ -204,6 +307,18 @@ class Store:
                 "INSERT OR IGNORE INTO sensor (sensor_id, asset_id, sensor_type) VALUES (?, ?, ?)",
                 SITE_SENSORS,
             )
+            for rule in ATTRIBUTION_RULES:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO attribution_rule_config (
+                        rule_id, defect_type, formula_type, params, confidence
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rule["rule_id"], rule["defect_type"], rule["formula_type"],
+                        json.dumps(rule["params"], sort_keys=True), rule["confidence"],
+                    ),
+                )
 
     def cached_media(self, content_hash: str) -> dict | None:
         with self.connect() as db:
@@ -296,6 +411,33 @@ class Store:
                 ORDER BY ts ASC, reading_id ASC
                 """,
                 (since_utc,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def performance_reading(self, reading_id: int) -> dict | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT reading_id, ts, headwater_level, tailwater_level,
+                       gate_position, theoretical_mw, actual_mw, gap_pct
+                FROM performance_reading WHERE reading_id = ?
+                """,
+                (reading_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def pending_attribution_readings(self, threshold_pct: float) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT p.reading_id, p.ts, p.headwater_level, p.tailwater_level,
+                       p.gate_position, p.theoretical_mw, p.actual_mw, p.gap_pct
+                FROM performance_reading p
+                LEFT JOIN attribution_run r ON r.reading_id = p.reading_id
+                WHERE p.gap_pct > ? AND r.reading_id IS NULL
+                ORDER BY p.ts, p.reading_id
+                """,
+                (threshold_pct,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -481,6 +623,105 @@ class Store:
                 values,
             ).fetchall()
         return [self._event_dict(row) for row in rows]
+
+    def closest_prior_active_detection_events(
+        self,
+        reading_ts: datetime,
+        *,
+        window_seconds: int,
+    ) -> list[dict]:
+        end = reading_ts.astimezone(timezone.utc)
+        start = end.timestamp() - window_seconds
+        start_iso = datetime.fromtimestamp(start, timezone.utc).isoformat()
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT e.*
+                FROM detection_event e
+                WHERE e.asset_id <> 'main_transformer'
+                  AND e.ts >= ? AND e.ts <= ?
+                ORDER BY e.ts DESC, e.event_id DESC
+                """,
+                (start_iso, end.isoformat()),
+            ).fetchall()
+        closest: dict[tuple[str, str], dict] = {}
+        for row in rows:
+            event = self._event_dict(row)
+            closest.setdefault((event["asset_id"], event["detection_type"]), event)
+        # A newer healthy event resolves an older defect. Filter only after
+        # selecting current state; otherwise stale positive evidence would be
+        # incorrectly treated as active.
+        return [event for event in closest.values() if event["defect_present"]]
+
+    def attribution_rules(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM attribution_rule_config ORDER BY rule_id"
+            ).fetchall()
+        rules = []
+        for row in rows:
+            rule = dict(row)
+            rule["params"] = json.loads(rule["params"])
+            rules.append(rule)
+        return rules
+
+    def attribution_run(self, reading_id: int) -> dict | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM attribution_run WHERE reading_id = ?", (reading_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_attribution_run(
+        self,
+        reading_id: int,
+        threshold_pct: float,
+        contributions: list[dict],
+    ) -> None:
+        status = "attributed" if contributions else "unexplained"
+        with self.connect() as db:
+            existing = db.execute(
+                "SELECT 1 FROM attribution_run WHERE reading_id = ?", (reading_id,)
+            ).fetchone()
+            if existing:
+                return
+            for contribution in contributions:
+                db.execute(
+                    """
+                    INSERT INTO loss_attribution (
+                        reading_id, asset_id, event_id, estimated_loss_mw,
+                        confidence, method
+                    ) VALUES (?, ?, ?, ?, ?, 'rule_based')
+                    """,
+                    (
+                        reading_id, contribution["asset_id"], contribution["event_id"],
+                        contribution["estimated_loss_mw"], contribution["confidence"],
+                    ),
+                )
+            db.execute(
+                """
+                INSERT INTO attribution_run (reading_id, status, threshold_pct, processed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (reading_id, status, threshold_pct, utc_now()),
+            )
+
+    def loss_attributions(self, reading_id: int) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT l.attribution_id, l.reading_id, l.asset_id, a.name AS asset_name,
+                       l.event_id, e.detection_type, l.estimated_loss_mw,
+                       l.confidence, l.method
+                FROM loss_attribution l
+                JOIN asset a ON a.asset_id = l.asset_id
+                JOIN detection_event e ON e.event_id = l.event_id
+                WHERE l.reading_id = ?
+                ORDER BY l.estimated_loss_mw DESC, l.confidence DESC, l.attribution_id
+                """,
+                (reading_id,),
+            ).fetchall()
+        return [{**dict(row), "rank": index + 1} for index, row in enumerate(rows)]
 
     def latest_detection_event(self, asset_id: str, detection_type: str) -> dict | None:
         with self.connect() as db:

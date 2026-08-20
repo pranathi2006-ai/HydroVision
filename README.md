@@ -169,3 +169,26 @@ python3 scripts/import_training_dataset.py taco /path/to/TACO --split train
 Use `training/generate_phase3_synthetic.py` to generate deterministic,
 mask-preserving debris or pitting composites from locally licensed source
 images. Synthetic output is never generated or parsed during inference.
+
+## Phase 4 rule attribution
+
+Readings above `HYDROVISION_ATTRIBUTION_GAP_THRESHOLD_PCT` are matched only to
+the closest prior active Phase 3 evidence inside the configured time window.
+Geometric rack/gate rules and lower-confidence severity maps are stored in
+`attribution_rule_config`, so plant experts can tune coefficients without code
+changes. Results retain a required `event_id`, use `method=rule_based`, and are
+ranked by estimated MW while displaying confidence separately. Triggering gaps
+with no evidence are recorded and logged as unexplained.
+
+`actual_mw` must be measured at the generator terminal. Mock data declares that
+boundary explicitly; real-source attribution remains disabled until this is
+confirmed:
+
+```bash
+export HYDROVISION_ACTUAL_MW_METER_LOCATION=generator_terminal
+```
+
+Use `grid_connection` if that is the real boundary; transformer loss then needs
+a separately scoped design. Transformer thermal events are never candidates in
+the Phase 4 hydraulic ranking. Query a ranked result with
+`GET /api/performance/attribution?reading_id=<id>`.

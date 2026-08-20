@@ -107,6 +107,22 @@ def test_valid_new_reading_is_stored_with_phase_two_values(tmp_path: Path) -> No
     ) / rows[0]["theoretical_mw"] * 100, abs=1e-5)
 
 
+def test_new_reading_invokes_phase_four_callback_once(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
+    store = Store(tmp_path / "hydrovision.sqlite3")
+    attributed: list[int] = []
+    service = PerformanceIngestionService(
+        store,
+        FixedAdapter(valid_reading(now)),
+        PerformanceSettings(),
+        calculator(store),
+        on_reading_stored=attributed.append,
+    )
+
+    assert service.poll_once(now=now)
+    assert attributed == [store.performance_readings_since(now - timedelta(minutes=1))[0]["reading_id"]]
+
+
 def test_invalid_reading_is_rejected_and_logged(tmp_path: Path, caplog) -> None:
     now = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
     store = Store(tmp_path / "hydrovision.sqlite3")

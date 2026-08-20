@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image, ImageDraw, ImageOps
 from pydantic import BaseModel
 
+from .attribution import AttributionService, AttributionSettings
 from .detector import Detection, LocalDetector
 from .performance import PerformanceIngestionService, PerformanceSettings, build_adapter
 from .reference_curves import (
@@ -77,11 +78,19 @@ performance_calculation = PerformanceCalculationService(
     nameplate_capacity_mw=performance_settings.nameplate_capacity_mw,
 )
 performance_backfill_summary = performance_calculation.backfill()
+attribution_settings = AttributionSettings.from_env(performance_settings.source)
+attribution_service = AttributionService(
+    store,
+    performance_calculation.curves,
+    attribution_settings,
+)
+attribution_backfill_summary = attribution_service.backfill()
 performance_ingestion = PerformanceIngestionService(
     store,
     build_adapter(performance_settings),
     performance_settings,
     performance_calculation,
+    on_reading_stored=attribution_service.on_reading_stored,
 )
 
 allowed_origins = {
@@ -120,6 +129,12 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
+    expose_headers=[
+        "X-Poll-Interval-Seconds",
+        "X-Attribution-Threshold-Pct",
+        "X-Attribution-Enabled",
+        "X-Attribution-Meter-Location",
+    ],
 )
 
 
@@ -292,6 +307,14 @@ def health() -> dict:
         "nameplate_capacity_mw": performance_settings.nameplate_capacity_mw,
         "reference_curve_dataset": reference_dataset["dataset_name"] if reference_dataset else None,
         "performance_backfill": performance_backfill_summary,
+        "attribution": {
+            "enabled": attribution_settings.enabled,
+            "gap_threshold_pct": attribution_settings.threshold_pct,
+            "evidence_window_seconds": attribution_settings.evidence_window_seconds,
+            "actual_mw_meter_location": attribution_settings.meter_location,
+            "backfill": attribution_backfill_summary,
+            "transformer_excluded": True,
+        },
         "phase3": {
             "assets": len({row["asset_id"] for row in store.site_assets()}),
             "sensors": len(store.site_assets()),
@@ -310,7 +333,21 @@ def performance_readings(
     response.headers["X-Poll-Interval-Seconds"] = str(
         performance_settings.effective_interval_seconds
     )
+    response.headers["X-Attribution-Threshold-Pct"] = str(
+        attribution_settings.threshold_pct
+    )
+    response.headers["X-Attribution-Enabled"] = str(attribution_settings.enabled).lower()
+    response.headers["X-Attribution-Meter-Location"] = attribution_settings.meter_location
     return store.performance_readings_since(since.astimezone(timezone.utc))
+
+
+@app.get("/api/performance/attribution")
+def performance_attribution(reading_id: int = Query(..., gt=0)) -> list[dict]:
+    reading = store.performance_reading(reading_id)
+    if reading is None:
+        raise HTTPException(status_code=404, detail="Performance reading not found.")
+    attribution_service.attribute_reading(reading_id)
+    return store.loss_attributions(reading_id)
 
 
 @app.get("/api/snapshot")

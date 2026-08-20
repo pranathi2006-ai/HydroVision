@@ -76,7 +76,7 @@ button { color: inherit; }
 .performance-metrics { border: 1px solid var(--line); background: var(--card); display: grid; grid-template-columns: repeat(4, 1fr); }
 .performance-card { background: var(--card); border: 1px solid var(--line); min-width: 0; min-height: 440px; }
 .poll-cadence { color: var(--muted); font: 9px monospace; letter-spacing: 1px; }
-.performance-table { min-width: 760px; }
+.performance-table { min-width: 1120px; }
 .performance-table td { font-variant-numeric: tabular-nums; }
 .performance-table td b { font-size: 13px; }
 .performance-empty { min-height: 310px; display: grid; place-content: center; text-align: center; gap: 7px; color: var(--muted); }
@@ -91,5 +91,11 @@ button { color: inherit; }
 .chart-actual { stroke: var(--green); }.chart-theoretical { stroke: var(--orange); }
 .chart-legend { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 9px; }.chart-legend span { display: flex; align-items: center; gap: 6px; }.chart-legend i { width: 18px; border-top: 2px solid; }.chart-legend .actual { border-color: var(--green); }.chart-legend .theoretical { border-color: var(--orange); }
 .chart-empty { min-height: 180px; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
+.attribution-ranking { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; min-width: 190px; }
+.attribution-ranking li { display: grid; grid-template-columns: 20px 1fr; align-items: center; gap: 7px; }
+.attribution-ranking li > b { width: 20px; height: 20px; display: grid; place-items: center; background: var(--ink); color: var(--lime); font: 9px monospace; }
+.attribution-ranking strong { font-size: 10px; }.attribution-ranking small { margin-top: 2px; font: 8px monospace; }
+.attribution-unexplained { color: #9d5f18; font-size: 9px; line-height: 1.4; display: block; max-width: 175px; }
+.attribution-not-triggered { color: var(--muted); font-size: 9px; white-space: nowrap; }
 @media (max-width: 900px) { .performance-metrics { grid-template-columns: repeat(2, 1fr); }.performance-metrics .metric:nth-child(2) { border-right: 0; }.performance-metrics .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); } }
 @media (max-width: 560px) { .performance-metrics { grid-template-columns: 1fr; }.performance-metrics .metric { border-right: 0; border-bottom: 1px solid var(--line); }.performance-metrics .metric:last-child { border-bottom: 0; }.poll-cadence { display: none; }.chart-legend { gap: 7px; font-size: 8px; }.chart-legend i { width: 10px; } }
