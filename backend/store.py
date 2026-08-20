@@ -21,6 +21,25 @@ LOCATIONS = [
     {"id": "draft-tube", "name": "Draft tube", "zone": "Lower gallery", "x": 71, "y": 75},
 ]
 
+SITE_ASSETS = [
+    ("turbine_1", "Turbine 1", "turbine"),
+    ("turbine_2", "Turbine 2", "turbine"),
+    ("penstock_valve", "Penstock valve", "penstock"),
+    ("main_transformer", "Main transformer", "transformer"),
+    ("intake_gate", "Intake gate", "intake"),
+    ("draft_tube", "Draft tube", "draft_tube"),
+]
+
+SITE_SENSORS = [
+    ("turbine_1_camera", "turbine_1", "camera"),
+    ("turbine_2_camera", "turbine_2", "camera"),
+    ("penstock_valve_camera", "penstock_valve", "camera"),
+    ("main_transformer_camera", "main_transformer", "camera"),
+    ("main_transformer_thermal", "main_transformer", "thermal_camera"),
+    ("intake_gate_camera", "intake_gate", "camera"),
+    ("draft_tube_camera", "draft_tube", "camera"),
+]
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -120,11 +139,71 @@ class Store:
                     ON gate_flow_curve(gate_position, head_m);
                 CREATE UNIQUE INDEX IF NOT EXISTS loss_curve_point_idx
                     ON hydraulic_loss_baseline(flow_m3s);
+                CREATE TABLE IF NOT EXISTS asset (
+                    asset_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    asset_type TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sensor (
+                    sensor_id TEXT PRIMARY KEY,
+                    asset_id TEXT NOT NULL,
+                    sensor_type TEXT NOT NULL CHECK (sensor_type IN ('camera', 'thermal_camera')),
+                    FOREIGN KEY (asset_id) REFERENCES asset(asset_id)
+                );
+                CREATE TABLE IF NOT EXISTS training_dataset (
+                    dataset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dataset_key TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    detection_type TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    license TEXT NOT NULL,
+                    modality TEXT NOT NULL,
+                    notes TEXT
+                );
+                CREATE TABLE IF NOT EXISTS training_image (
+                    image_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dataset_id INTEGER NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    content_hash TEXT NOT NULL UNIQUE,
+                    split TEXT NOT NULL,
+                    synthetic INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (dataset_id) REFERENCES training_dataset(dataset_id)
+                );
+                CREATE TABLE IF NOT EXISTS detection_event (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    sensor_id TEXT NOT NULL,
+                    media_id INTEGER,
+                    detection_type TEXT NOT NULL,
+                    defect_present INTEGER NOT NULL,
+                    severity TEXT NOT NULL,
+                    confidence REAL,
+                    bbox_json TEXT,
+                    measurement TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (asset_id) REFERENCES asset(asset_id),
+                    FOREIGN KEY (sensor_id) REFERENCES sensor(sensor_id),
+                    FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE SET NULL,
+                    UNIQUE (asset_id, sensor_id, detection_type, cache_key)
+                );
+                CREATE INDEX IF NOT EXISTS detection_event_asset_ts_idx
+                    ON detection_event(asset_id, ts DESC);
                 """
             )
             media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
             if "cleared_at" not in media_columns:
                 db.execute("ALTER TABLE media ADD COLUMN cleared_at TEXT")
+            db.executemany(
+                "INSERT OR IGNORE INTO asset (asset_id, name, asset_type) VALUES (?, ?, ?)",
+                SITE_ASSETS,
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO sensor (sensor_id, asset_id, sensor_type) VALUES (?, ?, ?)",
+                SITE_SENSORS,
+            )
 
     def cached_media(self, content_hash: str) -> dict | None:
         with self.connect() as db:
@@ -196,6 +275,14 @@ class Store:
                 "SELECT ts FROM performance_reading ORDER BY ts DESC, reading_id DESC LIMIT 1"
             ).fetchone()
         return datetime.fromisoformat(row["ts"]).astimezone(timezone.utc) if row else None
+
+    def latest_gate_position(self) -> float | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT gate_position FROM performance_reading "
+                "WHERE gate_position IS NOT NULL ORDER BY ts DESC, reading_id DESC LIMIT 1"
+            ).fetchone()
+        return float(row["gate_position"]) if row else None
 
     def performance_readings_since(self, since: datetime) -> list[dict]:
         since_utc = since.astimezone(timezone.utc).isoformat()
@@ -316,6 +403,138 @@ class Store:
                         item["affected_area_pct"], json.dumps(item["bbox"]), utc_now(),
                     ),
                 )
+
+    def site_assets(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT a.asset_id, a.name, a.asset_type,
+                       s.sensor_id, s.sensor_type
+                FROM asset a JOIN sensor s ON s.asset_id = a.asset_id
+                ORDER BY a.asset_id, s.sensor_type, s.sensor_id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def sensor(self, sensor_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM sensor WHERE sensor_id = ?", (sensor_id,)).fetchone()
+        return dict(row) if row else None
+
+    def cached_detection_events(self, cache_key: str) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM detection_event WHERE cache_key = ? ORDER BY event_id",
+                (cache_key,),
+            ).fetchall()
+        return [self._event_dict(row) for row in rows]
+
+    def insert_detection_events(
+        self,
+        *,
+        asset_id: str,
+        sensor_id: str,
+        media_id: int | None,
+        cache_key: str,
+        events: list[dict],
+    ) -> list[dict]:
+        now = utc_now()
+        with self.connect() as db:
+            for event in events:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO detection_event (
+                        ts, asset_id, sensor_id, media_id, detection_type,
+                        defect_present, severity, confidence, bbox_json,
+                        measurement, engine, cache_key, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.get("ts", now), asset_id, sensor_id, media_id,
+                        event["detection_type"], int(event["defect_present"]),
+                        event["severity"], event.get("confidence"),
+                        json.dumps(event["bbox"]) if event.get("bbox") is not None else None,
+                        json.dumps(event["measurement"], sort_keys=True), event["engine"],
+                        cache_key, now,
+                    ),
+                )
+        return self.cached_detection_events(cache_key)
+
+    def detection_events(
+        self,
+        *,
+        asset_id: str | None = None,
+        since: datetime | None = None,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        values: list[str] = []
+        if asset_id:
+            clauses.append("asset_id = ?")
+            values.append(asset_id)
+        if since:
+            clauses.append("ts >= ?")
+            values.append(since.astimezone(timezone.utc).isoformat())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as db:
+            rows = db.execute(
+                f"SELECT * FROM detection_event {where} ORDER BY ts DESC, event_id DESC LIMIT 2000",
+                values,
+            ).fetchall()
+        return [self._event_dict(row) for row in rows]
+
+    def latest_detection_event(self, asset_id: str, detection_type: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM detection_event
+                WHERE asset_id = ? AND detection_type = ?
+                ORDER BY ts DESC, event_id DESC LIMIT 1
+                """,
+                (asset_id, detection_type),
+            ).fetchone()
+        return self._event_dict(row) if row else None
+
+    @staticmethod
+    def _event_dict(row: sqlite3.Row) -> dict:
+        event = dict(row)
+        event["defect_present"] = bool(event["defect_present"])
+        event["measurement"] = json.loads(event["measurement"])
+        bbox_json = event.pop("bbox_json")
+        event["bbox"] = json.loads(bbox_json) if bbox_json else None
+        return event
+
+    def upsert_training_dataset(self, dataset: dict) -> int:
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO training_dataset (
+                    dataset_key, name, detection_type, source_url, license, modality, notes
+                ) VALUES (:dataset_key, :name, :detection_type, :source_url, :license, :modality, :notes)
+                ON CONFLICT(dataset_key) DO UPDATE SET
+                    name=excluded.name, detection_type=excluded.detection_type,
+                    source_url=excluded.source_url, license=excluded.license,
+                    modality=excluded.modality, notes=excluded.notes
+                """,
+                dataset,
+            )
+            row = db.execute(
+                "SELECT dataset_id FROM training_dataset WHERE dataset_key = ?",
+                (dataset["dataset_key"],),
+            ).fetchone()
+        return int(row["dataset_id"])
+
+    def insert_training_image(self, dataset_id: int, image: dict) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                INSERT OR IGNORE INTO training_image (
+                    dataset_id, source_ref, content_hash, split, synthetic
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (dataset_id, image["source_ref"], image["content_hash"],
+                 image["split"], int(image.get("synthetic", False))),
+            )
+        return cursor.rowcount == 1
 
     def review(self, finding_id: int, status: str) -> bool:
         with self.connect() as db:

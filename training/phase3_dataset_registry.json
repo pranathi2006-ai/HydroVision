@@ -1,0 +1,20 @@
+[
+  {
+    "dataset_key": "taco",
+    "name": "TACO: Trash Annotations in Context",
+    "detection_type": "trash_rack_blockage,draft_tube_blockage",
+    "source_url": "https://github.com/pedropro/TACO",
+    "license": "CC BY 4.0",
+    "modality": "RGB instance segmentation",
+    "notes": "Adjacent-domain litter/debris masks; retain source attribution on every imported image."
+  },
+  {
+    "dataset_key": "mvtec_ad_2",
+    "name": "MVTec Anomaly Detection 2",
+    "detection_type": "cavitation_wear",
+    "source_url": "https://www.mvtec.com/research-teaching/datasets/mvtec-ad-2",
+    "license": "CC BY-NC-SA 4.0",
+    "modality": "RGB anomaly segmentation",
+    "notes": "Closest verified-license metal/surface anomaly reference. Non-commercial and share-alike restrictions apply."
+  }
+]

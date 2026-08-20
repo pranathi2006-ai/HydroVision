@@ -140,3 +140,32 @@ criterion with:
 ```bash
 python3 scripts/check_performance_soak.py --hours 24 --interval-seconds 300 --nameplate-mw 75
 ```
+
+## Phase 3 site detectors
+
+The existing upload endpoint now routes each location to an exact asset/sensor
+mapping and writes a `detection_event` for every applicable detector result,
+including explicit healthy results. The routing is:
+
+- intake gate: trash-rack blockage area plus geometric gate-position mismatch
+- penstock valve: the existing local oil-leak and corrosion heads
+- each turbine: cavitation/pitting wear area
+- draft tube: the existing corrosion head plus blockage area
+- main transformer: thermal ΔT with three-frame persistence
+
+All paths are local OpenCV or optional local YOLO weights. Uploads retain the
+existing SHA-256 cache and 2.5-second video sampling. `GET /api/detection-events`
+returns the structured events, while `measurement` contains values such as
+`blockage_pct`, visual/commanded gate position, pitting area, or thermal ΔT.
+
+The public-data provenance registry is
+`training/phase3_dataset_registry.json`. Register actual downloaded images and
+their hashes without copying pixels into the database:
+
+```bash
+python3 scripts/import_training_dataset.py taco /path/to/TACO --split train
+```
+
+Use `training/generate_phase3_synthetic.py` to generate deterministic,
+mask-preserving debris or pitting composites from locally licensed source
+images. Synthetic output is never generated or parsed during inference.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -25,6 +26,7 @@ from .reference_curves import (
     PerformanceCurveModel,
     import_reference_curves,
 )
+from .site_detectors import DEFAULT_SENSOR, LOCATION_TO_ASSET, SiteDetectionService
 from .store import LOCATIONS, Store
 
 
@@ -40,7 +42,12 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo"}
 
 store = Store(DATA_DIR / "hydrovision.sqlite3")
+phase3_registry_path = ROOT / "training" / "phase3_dataset_registry.json"
+if phase3_registry_path.is_file():
+    for phase3_dataset in json.loads(phase3_registry_path.read_text()):
+        store.upsert_training_dataset(phase3_dataset)
 detector = LocalDetector()
+site_detection = SiteDetectionService(store, detector)
 performance_settings = PerformanceSettings.from_env()
 reference_dataset = store.reference_curve_dataset()
 if reference_dataset is None:
@@ -170,7 +177,12 @@ def persist_image(
     cached = store.cached_media(content_hash)
     if cached:
         store.restore_media(cached["id"])
-        return {"cached": True, "media_id": cached["id"], "hash": content_hash}, None, None
+        return {
+            "cached": True,
+            "media_id": cached["id"],
+            "hash": content_hash,
+            "stored_name": cached["stored_name"],
+        }, None, None
 
     jpeg, image, width, height = normalize_image(raw)
     stored_name = f"{content_hash[:24]}.jpg"
@@ -187,7 +199,12 @@ def persist_image(
         sampled_second=sampled_second,
         inference_engine=detector.engine_name,
     )
-    return {"cached": False, "media_id": media_id, "hash": content_hash}, image, media_id
+    return {
+        "cached": False,
+        "media_id": media_id,
+        "hash": content_hash,
+        "stored_name": stored_name,
+    }, image, media_id
 
 
 def seed_demo_data() -> None:
@@ -275,6 +292,11 @@ def health() -> dict:
         "nameplate_capacity_mw": performance_settings.nameplate_capacity_mw,
         "reference_curve_dataset": reference_dataset["dataset_name"] if reference_dataset else None,
         "performance_backfill": performance_backfill_summary,
+        "phase3": {
+            "assets": len({row["asset_id"] for row in store.site_assets()}),
+            "sensors": len(store.site_assets()),
+            "inference": "local-only",
+        },
     }
 
 
@@ -301,15 +323,38 @@ def locations() -> list[dict]:
     return LOCATIONS
 
 
+@app.get("/api/site-assets")
+def site_assets() -> list[dict]:
+    return store.site_assets()
+
+
+@app.get("/api/detection-events")
+def detection_events(
+    asset_id: str | None = Query(default=None),
+    since: datetime | None = Query(default=None),
+) -> list[dict]:
+    if asset_id and asset_id not in DEFAULT_SENSOR:
+        raise HTTPException(status_code=400, detail="Unknown asset.")
+    if since and since.tzinfo is None:
+        raise HTTPException(status_code=422, detail="since must include a timezone offset")
+    return store.detection_events(asset_id=asset_id, since=since)
+
+
 @app.post("/api/upload")
 async def upload(
     files: list[UploadFile] = File(...),
     location_id: str = Form(...),
+    sensor_id: str | None = Form(default=None),
 ) -> dict:
     if location_id not in {item["id"] for item in LOCATIONS}:
         raise HTTPException(status_code=400, detail="Unknown monitored location.")
     if not files or len(files) > 20:
         raise HTTPException(status_code=400, detail="Upload between 1 and 20 files per batch.")
+    asset_id = LOCATION_TO_ASSET[location_id]
+    selected_sensor = sensor_id or DEFAULT_SENSOR[asset_id]
+    sensor = store.sensor(selected_sensor)
+    if sensor is None or sensor["asset_id"] != asset_id:
+        raise HTTPException(status_code=400, detail="Sensor is not assigned to the selected asset.")
 
     processed: list[dict] = []
     pending: list[tuple[np.ndarray, int]] = []
@@ -347,12 +392,33 @@ async def upload(
         store.insert_findings(media_id, rows)
         finding_count += len(rows)
 
+    new_images = {media_id: image for image, media_id in pending}
+    event_rows: list[dict] = []
+    for item in processed:
+        media_id = int(item["media_id"])
+        image = new_images.get(media_id)
+        if image is None:
+            image = cv2.imread(str(MEDIA_DIR / item["stored_name"]))
+        if image is None:
+            raise HTTPException(status_code=500, detail="Stored evidence image could not be decoded.")
+        event_rows.extend(site_detection.analyze(
+            image=image,
+            media_id=media_id,
+            content_hash=item["hash"],
+            asset_id=asset_id,
+            sensor_id=selected_sensor,
+        ))
+
     return {
         "files_received": len(files),
         "images_analyzed": len(pending),
         "cached_images": sum(bool(item["cached"]) for item in processed),
         "sampled_video_frames": video_frames,
         "findings_created": finding_count,
+        "detection_events": event_rows,
+        "site_events_returned": len(event_rows),
+        "asset_id": asset_id,
+        "sensor_id": selected_sensor,
         "sample_interval_seconds": VIDEO_SAMPLE_SECONDS,
         "snapshot": store.snapshot(),
     }
