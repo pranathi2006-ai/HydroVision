@@ -212,3 +212,49 @@ The `recommended_action` table is created and seeded by
 `backend/migrations/005_dashboard_recommendations.sql`. Recommendations are
 static lookups only. Selecting a marker or waterfall segment opens the same
 evidence detail panel and does not trigger an LLM request.
+
+## Phase 6 learned attribution
+
+Phase 6 retains the Phase 4 rule output as the baseline and uses an
+interpretable logistic-regression model to estimate the probability that each
+candidate site is a confirmed cause. The learned MW estimate is the rule MW
+estimate weighted by that probability. Features include severity and measured
+defect value, rule estimate, asset criticality, maintenance age, asset/defect,
+and the reading's gap magnitude. Coefficients and per-prediction feature
+contributions are stored as JSON in the shared `correlation_model_version`
+registry and `loss_attribution` row.
+
+Record one final engineer outcome per attribution:
+
+```bash
+curl -X POST http://localhost:8001/api/loss-attribution/123/feedback \
+  -H 'Content-Type: application/json' \
+  -d '{"confirmed":true,"notes":"Output recovered after rack cleaning","confirmed_by":"engineer.name"}'
+```
+
+Use the management command for manual training and review:
+
+```bash
+python3 scripts/manage_loss_attribution_model.py status
+python3 scripts/manage_loss_attribution_model.py train
+python3 scripts/manage_loss_attribution_model.py compare lossattr-YYYYMMDDHHMMSS-id
+python3 scripts/manage_loss_attribution_model.py promote lossattr-YYYYMMDDHHMMSS-id \
+  --approved-by engineer.name \
+  --confirm 'PROMOTE lossattr-YYYYMMDDHHMMSS-id'
+```
+
+Every new or retrained version starts in `shadow`. During shadow operation the
+rule estimate remains the displayed value, while the model probability and MW
+estimate are stored separately. The daily scheduler checks for either the
+configured monthly interval or enough new feedback and can only train another
+shadow version; it has no promotion code path. Promotion requires a real shadow
+comparison after at least 14 days and the configured number of confirmed shadow
+outcomes, a clear Brier-score improvement, a named approver, and the exact
+confirmation phrase. A database trigger rejects activation without comparison
+and approval fields.
+
+After promotion, defect types below
+`HYDROVISION_LEARNED_MIN_DEFECT_ROWS` continue using `method=rule_based`.
+The detail panel displays the method used for the current estimate. With no
+confirmed outcomes in the local database, the integrated application remains
+on the Phase 4 rule engine and no synthetic feedback is inserted.

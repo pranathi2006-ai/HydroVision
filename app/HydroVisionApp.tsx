@@ -65,7 +65,7 @@ type LossAttribution = {
   detection_type: string;
   estimated_loss_mw: number;
   confidence: number;
-  method: "rule_based";
+  method: "rule_based" | "learned";
 };
 
 type DetectionEvent = {
@@ -636,7 +636,8 @@ function SiteDetailPanel({ site, onClose }: { site: DashboardSite; onClose: () =
           <div><dt>Latest detection</dt><dd>{event ? titleCase(event.detection_type) : "No detection event"}</dd></div>
           <div><dt>Measurement</dt><dd>{event ? measurementSummary(event.measurement) : "—"}</dd></div>
           <div><dt>Estimated impact</dt><dd>{attribution ? `${attribution.estimated_loss_mw.toFixed(2)} MW` : "Not currently attributed"}</dd></div>
-          <div><dt>Attribution confidence</dt><dd>{attribution ? `${Math.round(attribution.confidence * 100)}% · rule based` : "—"}</dd></div>
+          <div><dt>Attribution confidence</dt><dd>{attribution ? `${Math.round(attribution.confidence * 100)}%` : "—"}</dd></div>
+          <div><dt>Estimate method</dt><dd>{attribution ? titleCase(attribution.method) : "—"}</dd></div>
         </dl>
         <section className="recommended-action">
           <span>RECOMMENDED ACTION</span>

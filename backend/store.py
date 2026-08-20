@@ -30,6 +30,15 @@ SITE_ASSETS = [
     ("draft_tube", "Draft tube", "draft_tube"),
 ]
 
+ASSET_CRITICALITY = {
+    "turbine_1": 1.0,
+    "turbine_2": 1.0,
+    "penstock_valve": 0.9,
+    "main_transformer": 0.85,
+    "intake_gate": 0.85,
+    "draft_tube": 0.75,
+}
+
 SITE_SENSORS = [
     ("turbine_1_camera", "turbine_1", "camera"),
     ("turbine_2_camera", "turbine_2", "camera"),
@@ -235,7 +244,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS asset (
                     asset_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
-                    asset_type TEXT NOT NULL
+                    asset_type TEXT NOT NULL,
+                    criticality REAL NOT NULL DEFAULT 0.5,
+                    last_maintenance_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS sensor (
                     sensor_id TEXT PRIMARY KEY,
@@ -291,6 +302,26 @@ class Store:
                     params TEXT NOT NULL,
                     confidence REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS correlation_model_version (
+                    model_id TEXT PRIMARY KEY,
+                    purpose TEXT NOT NULL DEFAULT 'event_correlation',
+                    model_type TEXT,
+                    status TEXT NOT NULL DEFAULT 'shadow',
+                    created_at TEXT NOT NULL,
+                    trained_at TEXT,
+                    training_rows INTEGER,
+                    validation_rows INTEGER,
+                    metrics_json TEXT,
+                    comparison_metrics_json TEXT,
+                    artifact_json TEXT,
+                    defect_counts_json TEXT,
+                    shadow_started_at TEXT,
+                    approved_by TEXT,
+                    approved_at TEXT,
+                    approval_notes TEXT,
+                    supersedes_model_id TEXT,
+                    FOREIGN KEY (supersedes_model_id) REFERENCES correlation_model_version(model_id)
+                );
                 CREATE TABLE IF NOT EXISTS loss_attribution (
                     attribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     reading_id INTEGER NOT NULL,
@@ -299,9 +330,19 @@ class Store:
                     estimated_loss_mw REAL NOT NULL,
                     confidence REAL NOT NULL,
                     method TEXT NOT NULL,
+                    model_id TEXT,
+                    rule_estimate_mw REAL,
+                    rule_confidence REAL,
+                    shadow_estimate_mw REAL,
+                    shadow_probability REAL,
+                    shadow_model_id TEXT,
+                    model_explanation TEXT,
+                    shadow_explanation TEXT,
                     FOREIGN KEY (reading_id) REFERENCES performance_reading(reading_id),
                     FOREIGN KEY (asset_id) REFERENCES asset(asset_id),
                     FOREIGN KEY (event_id) REFERENCES detection_event(event_id),
+                    FOREIGN KEY (model_id) REFERENCES correlation_model_version(model_id),
+                    FOREIGN KEY (shadow_model_id) REFERENCES correlation_model_version(model_id),
                     UNIQUE (reading_id, event_id)
                 );
                 CREATE TABLE IF NOT EXISTS attribution_run (
@@ -317,15 +358,105 @@ class Store:
                     defect_type TEXT PRIMARY KEY,
                     default_recommendation TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS attribution_feedback (
+                    feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attribution_id INTEGER NOT NULL UNIQUE,
+                    confirmed INTEGER NOT NULL,
+                    notes TEXT,
+                    confirmed_by TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    FOREIGN KEY (attribution_id) REFERENCES loss_attribution(attribution_id)
+                );
+                CREATE INDEX IF NOT EXISTS attribution_feedback_confirmed_at_idx
+                    ON attribution_feedback(confirmed_at DESC);
                 """
             )
             media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
             if "cleared_at" not in media_columns:
                 db.execute("ALTER TABLE media ADD COLUMN cleared_at TEXT")
-            db.executemany(
-                "INSERT OR IGNORE INTO asset (asset_id, name, asset_type) VALUES (?, ?, ?)",
-                SITE_ASSETS,
+            asset_columns = {row["name"] for row in db.execute("PRAGMA table_info(asset)")}
+            criticality_added = "criticality" not in asset_columns
+            if criticality_added:
+                db.execute("ALTER TABLE asset ADD COLUMN criticality REAL NOT NULL DEFAULT 0.5")
+            if "last_maintenance_at" not in asset_columns:
+                db.execute("ALTER TABLE asset ADD COLUMN last_maintenance_at TEXT")
+            model_columns = {row["name"] for row in db.execute(
+                "PRAGMA table_info(correlation_model_version)"
+            )}
+            model_column_definitions = {
+                "purpose": "TEXT NOT NULL DEFAULT 'event_correlation'",
+                "model_type": "TEXT",
+                "status": "TEXT NOT NULL DEFAULT 'shadow'",
+                "created_at": "TEXT",
+                "trained_at": "TEXT",
+                "training_rows": "INTEGER",
+                "validation_rows": "INTEGER",
+                "metrics_json": "TEXT",
+                "comparison_metrics_json": "TEXT",
+                "artifact_json": "TEXT",
+                "defect_counts_json": "TEXT",
+                "shadow_started_at": "TEXT",
+                "approved_by": "TEXT",
+                "approved_at": "TEXT",
+                "approval_notes": "TEXT",
+                "supersedes_model_id": "TEXT",
+            }
+            for column, definition in model_column_definitions.items():
+                if column not in model_columns:
+                    db.execute(
+                        f"ALTER TABLE correlation_model_version ADD COLUMN {column} {definition}"
+                    )
+            attribution_columns = {row["name"] for row in db.execute(
+                "PRAGMA table_info(loss_attribution)"
+            )}
+            attribution_column_definitions = {
+                "model_id": "TEXT",
+                "rule_estimate_mw": "REAL",
+                "rule_confidence": "REAL",
+                "shadow_estimate_mw": "REAL",
+                "shadow_probability": "REAL",
+                "shadow_model_id": "TEXT",
+                "model_explanation": "TEXT",
+                "shadow_explanation": "TEXT",
+            }
+            for column, definition in attribution_column_definitions.items():
+                if column not in attribution_columns:
+                    db.execute(f"ALTER TABLE loss_attribution ADD COLUMN {column} {definition}")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS loss_attribution_shadow_model_idx "
+                "ON loss_attribution(shadow_model_id, attribution_id)"
             )
+            db.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS correlation_model_activation_guard
+                BEFORE UPDATE OF status, approved_by, approved_at, comparison_metrics_json
+                ON correlation_model_version
+                WHEN NEW.purpose = 'loss_attribution' AND NEW.status = 'active'
+                  AND (NEW.comparison_metrics_json IS NULL OR NEW.approved_by IS NULL OR NEW.approved_at IS NULL)
+                BEGIN
+                  SELECT RAISE(ABORT, 'loss-attribution model activation requires comparison metrics and explicit approval');
+                END;
+                CREATE TRIGGER IF NOT EXISTS correlation_model_activation_insert_guard
+                BEFORE INSERT ON correlation_model_version
+                WHEN NEW.purpose = 'loss_attribution' AND NEW.status = 'active'
+                  AND (NEW.comparison_metrics_json IS NULL OR NEW.approved_by IS NULL OR NEW.approved_at IS NULL)
+                BEGIN
+                  SELECT RAISE(ABORT, 'loss-attribution model activation requires comparison metrics and explicit approval');
+                END;
+                """
+            )
+            db.executemany(
+                """
+                INSERT OR IGNORE INTO asset (asset_id, name, asset_type, criticality)
+                VALUES (?, ?, ?, ?)
+                """,
+                [(*asset, ASSET_CRITICALITY[asset[0]]) for asset in SITE_ASSETS],
+            )
+            if criticality_added:
+                db.executemany(
+                    "UPDATE asset SET criticality = ? WHERE asset_id = ?",
+                    [(criticality, asset_id) for asset_id, criticality in ASSET_CRITICALITY.items()],
+                )
             db.executemany(
                 "INSERT OR IGNORE INTO sensor (sensor_id, asset_id, sensor_type) VALUES (?, ?, ?)",
                 SITE_SENSORS,
@@ -721,12 +852,25 @@ class Store:
                     """
                     INSERT INTO loss_attribution (
                         reading_id, asset_id, event_id, estimated_loss_mw,
-                        confidence, method
-                    ) VALUES (?, ?, ?, ?, ?, 'rule_based')
+                        confidence, method, model_id, rule_estimate_mw,
+                        rule_confidence,
+                        shadow_estimate_mw, shadow_probability, shadow_model_id,
+                        model_explanation, shadow_explanation
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         reading_id, contribution["asset_id"], contribution["event_id"],
                         contribution["estimated_loss_mw"], contribution["confidence"],
+                        contribution.get("method", "rule_based"), contribution.get("model_id"),
+                        contribution.get("rule_estimate_mw", contribution["estimated_loss_mw"]),
+                        contribution.get("rule_confidence", contribution["confidence"]),
+                        contribution.get("shadow_estimate_mw"),
+                        contribution.get("shadow_probability"),
+                        contribution.get("shadow_model_id"),
+                        json.dumps(contribution["model_explanation"], sort_keys=True)
+                        if contribution.get("model_explanation") else None,
+                        json.dumps(contribution["shadow_explanation"], sort_keys=True)
+                        if contribution.get("shadow_explanation") else None,
                     ),
                 )
             db.execute(
@@ -743,7 +887,10 @@ class Store:
                 """
                 SELECT l.attribution_id, l.reading_id, l.asset_id, a.name AS asset_name,
                        l.event_id, e.detection_type, l.estimated_loss_mw,
-                       l.confidence, l.method
+                       l.confidence, l.method, l.model_id, l.rule_estimate_mw,
+                       l.rule_confidence,
+                       l.shadow_estimate_mw, l.shadow_probability, l.shadow_model_id,
+                       l.model_explanation, l.shadow_explanation
                 FROM loss_attribution l
                 JOIN asset a ON a.asset_id = l.asset_id
                 JOIN detection_event e ON e.event_id = l.event_id
@@ -752,7 +899,238 @@ class Store:
                 """,
                 (reading_id,),
             ).fetchall()
-        return [{**dict(row), "rank": index + 1} for index, row in enumerate(rows)]
+        result = []
+        for index, row in enumerate(rows, start=1):
+            item = dict(row)
+            for field in ("model_explanation", "shadow_explanation"):
+                item[field] = json.loads(item[field]) if item.get(field) else None
+            item["rank"] = index
+            result.append(item)
+        return result
+
+    def add_attribution_feedback(
+        self,
+        attribution_id: int,
+        *,
+        confirmed: bool,
+        notes: str | None,
+        confirmed_by: str,
+    ) -> dict:
+        reviewer = confirmed_by.strip()
+        if not reviewer:
+            raise ValueError("confirmed_by is required")
+        with self.connect() as db:
+            if db.execute(
+                "SELECT 1 FROM loss_attribution WHERE attribution_id = ?",
+                (attribution_id,),
+            ).fetchone() is None:
+                raise KeyError(attribution_id)
+            try:
+                cursor = db.execute(
+                    """
+                    INSERT INTO attribution_feedback (
+                        attribution_id, confirmed, notes, confirmed_by, confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (attribution_id, int(confirmed), notes, reviewer, utc_now()),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError("feedback already exists for this attribution") from error
+            row = db.execute(
+                "SELECT * FROM attribution_feedback WHERE feedback_id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        result = dict(row)
+        result["confirmed"] = bool(result["confirmed"])
+        return result
+
+    def confirmed_attribution_count(self) -> int:
+        with self.connect() as db:
+            return int(db.execute("SELECT COUNT(*) FROM attribution_feedback").fetchone()[0])
+
+    def labeled_attribution_rows(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT f.feedback_id, f.confirmed, f.confirmed_at,
+                       l.attribution_id, l.asset_id, l.event_id,
+                       COALESCE(l.rule_estimate_mw, l.estimated_loss_mw) AS rule_estimate_mw,
+                       COALESCE(l.rule_confidence, l.confidence) AS rule_confidence,
+                       e.detection_type, e.severity, e.measurement,
+                       a.criticality, a.last_maintenance_at,
+                       p.gap_pct, p.ts AS reading_ts
+                FROM attribution_feedback f
+                JOIN loss_attribution l ON l.attribution_id = f.attribution_id
+                JOIN detection_event e ON e.event_id = l.event_id
+                JOIN asset a ON a.asset_id = l.asset_id
+                JOIN performance_reading p ON p.reading_id = l.reading_id
+                ORDER BY f.confirmed_at, f.feedback_id
+                """
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["confirmed"] = bool(item["confirmed"])
+            item["measurement"] = json.loads(item["measurement"])
+            result.append(item)
+        return result
+
+    def attribution_feature_row(
+        self,
+        reading_id: int,
+        event_id: int,
+        asset_id: str,
+        rule_estimate_mw: float,
+        rule_confidence: float,
+    ) -> dict:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT ? AS rule_estimate_mw, ? AS rule_confidence,
+                       ? AS asset_id, e.detection_type, e.severity, e.measurement,
+                       a.criticality, a.last_maintenance_at,
+                       p.gap_pct, p.ts AS reading_ts
+                FROM detection_event e
+                JOIN asset a ON a.asset_id = ?
+                JOIN performance_reading p ON p.reading_id = ?
+                WHERE e.event_id = ?
+                """,
+                (
+                    rule_estimate_mw, rule_confidence, asset_id, asset_id,
+                    reading_id, event_id,
+                ),
+            ).fetchone()
+        if row is None:
+            raise KeyError((reading_id, event_id, asset_id))
+        result = dict(row)
+        result["measurement"] = json.loads(result["measurement"])
+        return result
+
+    def save_loss_model_version(self, model: dict) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE correlation_model_version
+                SET status = 'retired'
+                WHERE purpose = 'loss_attribution' AND status = 'shadow'
+                """
+            )
+            db.execute(
+                """
+                INSERT INTO correlation_model_version (
+                    model_id, purpose, model_type, status, created_at, trained_at,
+                    training_rows, validation_rows, metrics_json, artifact_json,
+                    defect_counts_json, shadow_started_at, supersedes_model_id
+                ) VALUES (?, 'loss_attribution', 'logistic_regression', 'shadow',
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    model["model_id"], model["created_at"], model["trained_at"],
+                    model["training_rows"], model["validation_rows"],
+                    json.dumps(model["metrics"], sort_keys=True),
+                    json.dumps(model["artifact"], sort_keys=True),
+                    json.dumps(model["defect_counts"], sort_keys=True),
+                    model["shadow_started_at"], model.get("supersedes_model_id"),
+                ),
+            )
+
+    def loss_model(self, status: str) -> dict | None:
+        if status not in {"shadow", "active"}:
+            raise ValueError("status must be shadow or active")
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM correlation_model_version
+                WHERE purpose = 'loss_attribution' AND status = ?
+                ORDER BY trained_at DESC, created_at DESC LIMIT 1
+                """,
+                (status,),
+            ).fetchone()
+        return self._loss_model_dict(row) if row else None
+
+    def loss_model_by_id(self, model_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM correlation_model_version WHERE model_id = ? AND purpose = 'loss_attribution'",
+                (model_id,),
+            ).fetchone()
+        return self._loss_model_dict(row) if row else None
+
+    @staticmethod
+    def _loss_model_dict(row: sqlite3.Row) -> dict:
+        model = dict(row)
+        for column in (
+            "metrics_json", "comparison_metrics_json", "artifact_json", "defect_counts_json",
+        ):
+            value = model.pop(column)
+            model[column.removesuffix("_json")] = json.loads(value) if value else None
+        return model
+
+    def shadow_feedback_rows(self, model_id: str) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT f.confirmed, COALESCE(l.rule_confidence, l.confidence) AS rule_probability,
+                       l.shadow_probability
+                FROM attribution_feedback f
+                JOIN loss_attribution l ON l.attribution_id = f.attribution_id
+                WHERE l.shadow_model_id = ? AND l.shadow_probability IS NOT NULL
+                ORDER BY f.confirmed_at, f.feedback_id
+                """,
+                (model_id,),
+            ).fetchall()
+        return [
+            {
+                "confirmed": bool(row["confirmed"]),
+                "rule_probability": float(row["rule_probability"]),
+                "shadow_probability": float(row["shadow_probability"]),
+            }
+            for row in rows
+        ]
+
+    def save_model_comparison(self, model_id: str, metrics: dict) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE correlation_model_version SET comparison_metrics_json = ?
+                WHERE model_id = ? AND purpose = 'loss_attribution' AND status = 'shadow'
+                """,
+                (json.dumps(metrics, sort_keys=True), model_id),
+            )
+
+    def activate_loss_model(
+        self,
+        model_id: str,
+        *,
+        approved_by: str,
+        approval_notes: str | None,
+    ) -> None:
+        with self.connect() as db:
+            model = db.execute(
+                """
+                SELECT comparison_metrics_json FROM correlation_model_version
+                WHERE model_id = ? AND purpose = 'loss_attribution' AND status = 'shadow'
+                """,
+                (model_id,),
+            ).fetchone()
+            if model is None:
+                raise ValueError("model is not an eligible shadow version")
+            if not model["comparison_metrics_json"]:
+                raise ValueError("shadow comparison has not been recorded")
+            db.execute(
+                """
+                UPDATE correlation_model_version SET status = 'retired'
+                WHERE purpose = 'loss_attribution' AND status = 'active'
+                """
+            )
+            db.execute(
+                """
+                UPDATE correlation_model_version
+                SET status = 'active', approved_by = ?, approved_at = ?, approval_notes = ?
+                WHERE model_id = ?
+                """,
+                (approved_by, utc_now(), approval_notes, model_id),
+            )
 
     def current_dashboard(self) -> dict:
         """Return one transactionally consistent read model for both Phase 5 views."""
@@ -811,6 +1189,8 @@ class Store:
             item = dict(row)
             item["rank"] = rank
             item["method"] = str(item["method"])
+            for field in ("model_explanation", "shadow_explanation"):
+                item[field] = json.loads(item[field]) if item.get(field) else None
             item["event"] = {
                 "event_id": item["event_id"],
                 "ts": item.pop("event_ts"),

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import io
+import json
 import re
+from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import Response
+import pytest
+from fastapi import HTTPException, Response
 from PIL import Image, ImageDraw
 
+import backend.main as main_api
 from backend.detector import LocalDetector
 from backend.main import (
     LAN_ORIGIN_REGEX,
@@ -17,6 +21,7 @@ from backend.main import (
     normalize_image,
     performance_settings,
 )
+from backend.store import Store
 
 
 def test_resize_is_enforced() -> None:
@@ -48,6 +53,55 @@ def test_current_dashboard_endpoint_uses_ingestion_cadence_and_six_sites() -> No
     )
     assert payload["poll_interval_seconds"] == performance_settings.effective_interval_seconds
     assert len(payload["sites"]) == 6
+
+
+def test_engineer_feedback_endpoint_captures_one_confirmed_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_store = Store(tmp_path / "hydrovision.sqlite3")
+    with local_store.connect() as db:
+        reading_id = db.execute(
+            """
+            INSERT INTO performance_reading (
+                ts, headwater_level, tailwater_level, gate_position,
+                theoretical_mw, actual_mw, gap_pct
+            ) VALUES ('2026-08-20T10:00:00+00:00', 118, 82, 60, 50, 42, 16)
+            """
+        ).lastrowid
+        event_id = db.execute(
+            """
+            INSERT INTO detection_event (
+                ts, asset_id, sensor_id, detection_type, defect_present,
+                severity, confidence, measurement, engine, cache_key, created_at
+            ) VALUES ('2026-08-20T09:55:00+00:00', 'penstock_valve',
+                      'penstock_valve_camera', 'oil_leak', 1, 'critical', 0.9,
+                      ?, 'test', 'feedback-endpoint-event', '2026-08-20T09:55:00+00:00')
+            """,
+            (json.dumps({"affected_area_pct": 12.0}),),
+        ).lastrowid
+        attribution_id = db.execute(
+            """
+            INSERT INTO loss_attribution (
+                reading_id, asset_id, event_id, estimated_loss_mw,
+                confidence, method, rule_estimate_mw, rule_confidence
+            ) VALUES (?, 'penstock_valve', ?, 1.5, 0.8, 'rule_based', 1.5, 0.8)
+            """,
+            (reading_id, event_id),
+        ).lastrowid
+    monkeypatch.setattr(main_api, "store", local_store)
+    payload = main_api.AttributionFeedbackRequest(
+        confirmed=True,
+        notes="Leak repair recovered output.",
+        confirmed_by="engineer.name",
+    )
+
+    feedback = main_api.attribution_feedback(int(attribution_id), payload)
+
+    assert feedback["confirmed"] is True
+    assert feedback["confirmed_by"] == "engineer.name"
+    with pytest.raises(HTTPException) as duplicate:
+        main_api.attribution_feedback(int(attribution_id), payload)
+    assert duplicate.value.status_code == 409
 
 
 def test_known_corrosion_patch_returns_bbox_and_confidence() -> None:

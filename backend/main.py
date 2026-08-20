@@ -21,6 +21,12 @@ from pydantic import BaseModel
 
 from .attribution import AttributionService, AttributionSettings
 from .detector import Detection, LocalDetector
+from .learned_attribution import (
+    LearnedAttributionRetrainingScheduler,
+    LearnedAttributionService,
+    LearnedAttributionSettings,
+    LearnedAttributionTrainer,
+)
 from .performance import PerformanceIngestionService, PerformanceSettings, build_adapter
 from .reference_curves import (
     PerformanceCalculationService,
@@ -79,10 +85,17 @@ performance_calculation = PerformanceCalculationService(
 )
 performance_backfill_summary = performance_calculation.backfill()
 attribution_settings = AttributionSettings.from_env(performance_settings.source)
+learned_attribution_settings = LearnedAttributionSettings.from_env()
+learned_attribution_service = LearnedAttributionService(store, learned_attribution_settings)
+learned_attribution_trainer = LearnedAttributionTrainer(store, learned_attribution_settings)
+learned_attribution_scheduler = LearnedAttributionRetrainingScheduler(
+    learned_attribution_trainer, learned_attribution_settings,
+)
 attribution_service = AttributionService(
     store,
     performance_calculation.curves,
     attribution_settings,
+    learned_service=learned_attribution_service,
 )
 attribution_backfill_summary = attribution_service.backfill()
 performance_ingestion = PerformanceIngestionService(
@@ -115,9 +128,11 @@ LAN_ORIGIN_REGEX = (
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     performance_ingestion.start()
+    learned_attribution_scheduler.start()
     try:
         yield
     finally:
+        await learned_attribution_scheduler.stop()
         await performance_ingestion.stop()
 
 
@@ -140,6 +155,12 @@ app.add_middleware(
 
 class ReviewRequest(BaseModel):
     status: str
+
+
+class AttributionFeedbackRequest(BaseModel):
+    confirmed: bool
+    notes: str | None = None
+    confirmed_by: str
 
 
 def safe_name(name: str) -> str:
@@ -314,6 +335,17 @@ def health() -> dict:
             "actual_mw_meter_location": attribution_settings.meter_location,
             "backfill": attribution_backfill_summary,
             "transformer_excluded": True,
+            "learned": {
+                "confirmed_outcomes": store.confirmed_attribution_count(),
+                "shadow_model_id": (
+                    store.loss_model("shadow") or {}
+                ).get("model_id"),
+                "active_model_id": (
+                    store.loss_model("active") or {}
+                ).get("model_id"),
+                "minimum_rows_per_defect": learned_attribution_settings.minimum_rows_per_defect,
+                "scheduled_retraining_is_shadow_only": True,
+            },
         },
         "phase3": {
             "assets": len({row["asset_id"] for row in store.site_assets()}),
@@ -348,6 +380,21 @@ def performance_attribution(reading_id: int = Query(..., gt=0)) -> list[dict]:
         raise HTTPException(status_code=404, detail="Performance reading not found.")
     attribution_service.attribute_reading(reading_id)
     return store.loss_attributions(reading_id)
+
+
+@app.post("/api/loss-attribution/{attribution_id}/feedback", status_code=201)
+def attribution_feedback(attribution_id: int, payload: AttributionFeedbackRequest) -> dict:
+    try:
+        return store.add_attribution_feedback(
+            attribution_id,
+            confirmed=payload.confirmed,
+            notes=payload.notes,
+            confirmed_by=payload.confirmed_by,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Loss attribution not found.") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @app.get("/api/dashboard/current")

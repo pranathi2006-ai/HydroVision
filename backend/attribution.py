@@ -5,9 +5,13 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from .reference_curves import PerformanceCurveModel
 from .store import Store
+
+if TYPE_CHECKING:
+    from .learned_attribution import LearnedAttributionService
 
 
 logger = logging.getLogger("hydrovision.performance.attribution")
@@ -45,17 +49,19 @@ class AttributionSettings:
 
 
 class AttributionService:
-    """Evidence-linked Phase 4 rules; no learned attribution or speculation."""
+    """Evidence-linked rules with optional Phase 6 shadow/approved scoring."""
 
     def __init__(
         self,
         store: Store,
         curves: PerformanceCurveModel,
         settings: AttributionSettings,
+        learned_service: "LearnedAttributionService | None" = None,
     ) -> None:
         self.store = store
         self.curves = curves
         self.settings = settings
+        self.learned_service = learned_service
         if not settings.enabled:
             logger.warning(
                 "gap attribution disabled actual_mw_meter_location=%s; "
@@ -126,6 +132,11 @@ class AttributionService:
                     contributions_by_asset[event["asset_id"]] = contribution
 
         contributions = list(contributions_by_asset.values())
+        if contributions and self.learned_service is not None:
+            # The learned service preserves the rule estimate, logs any shadow
+            # estimate separately, and only replaces the displayed value when
+            # a human-approved active model supports this specific defect type.
+            contributions = self.learned_service.score_contributions(reading_id, contributions)
 
         self.store.save_attribution_run(
             reading_id,

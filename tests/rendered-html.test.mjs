@@ -34,3 +34,11 @@ test("map and waterfall share one current-dashboard fetch and selection state", 
   assert.match(source, /selectedAssetId=\{selectedAssetId\}/);
   assert.match(source, /onSelect=\{setSelectedAssetId\}/);
 });
+
+test("detail panel identifies the stored attribution method without model calls", async () => {
+  const source = await readFile(new URL("../app/HydroVisionApp.tsx", import.meta.url), "utf8");
+  assert.match(source, /<dt>Estimate method<\/dt>/);
+  assert.match(source, /titleCase\(attribution\.method\)/);
+  const detail = source.slice(source.indexOf("function SiteDetailPanel"), source.indexOf("function FindingsView"));
+  assert.doesNotMatch(detail, /fetch\(|useEffect\(/);
+});
