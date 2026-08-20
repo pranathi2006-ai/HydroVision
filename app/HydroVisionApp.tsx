@@ -50,9 +50,9 @@ type PerformanceReading = {
   headwater_level: number;
   tailwater_level: number;
   gate_position: number;
-  theoretical_mw: null;
+  theoretical_mw: number | null;
   actual_mw: number;
-  gap_pct: null;
+  gap_pct: number | null;
 };
 
 type View = "twin" | "findings" | "performance";
@@ -454,19 +454,22 @@ function PerformanceView({ readings, pollSeconds }: { readings: PerformanceReadi
         <Metric value={formatReading(latest?.tailwater_level ?? null, 3)} label="Tailwater level" detail="m" />
         <Metric value={formatReading(latest?.gate_position ?? null, 2)} label="Gate position" detail="% open" />
       </div>
+      <ActualTheoreticalChart readings={readings} />
       <div className="performance-card">
         <div className="section-bar">
-          <div><span className="section-index">01</span><strong>Raw reading log · last 24 hours</strong></div>
+          <div><span className="section-index">02</span><strong>Raw reading log · last 24 hours</strong></div>
           <span className="poll-cadence">REFRESHES EVERY {cadenceMinutes} MIN</span>
         </div>
         <div className="table-wrap">
           <table className="performance-table">
-            <thead><tr><th>Timestamp</th><th>Generation output</th><th>Headwater</th><th>Tailwater</th><th>Gate position</th></tr></thead>
+            <thead><tr><th>Timestamp</th><th>Actual</th><th>Theoretical</th><th>Gap</th><th>Headwater</th><th>Tailwater</th><th>Gate position</th></tr></thead>
             <tbody>
               {newestFirst.map((reading) => (
                 <tr key={reading.reading_id}>
                   <td><strong>{new Date(reading.ts).toLocaleString()}</strong><small>{relativeDate(reading.ts)}</small></td>
                   <td><b>{formatReading(reading.actual_mw, 3)}</b><small>MW</small></td>
+                  <td><b>{formatReading(reading.theoretical_mw, 3)}</b><small>MW</small></td>
+                  <td><b>{formatReading(reading.gap_pct, 2)}</b><small>%</small></td>
                   <td><b>{formatReading(reading.headwater_level, 3)}</b><small>m</small></td>
                   <td><b>{formatReading(reading.tailwater_level, 3)}</b><small>m</small></td>
                   <td><b>{formatReading(reading.gate_position, 2)}</b><small>% open</small></td>
@@ -476,6 +479,61 @@ function PerformanceView({ readings, pollSeconds }: { readings: PerformanceReadi
           </table>
           {!readings.length && <div className="performance-empty"><b>Waiting for the first reading</b><span>The active source is polled on the configured minutes-scale interval.</span></div>}
         </div>
+      </div>
+    </section>
+  );
+}
+
+function ActualTheoreticalChart({ readings }: { readings: PerformanceReading[] }) {
+  const data = readings.filter((reading) => reading.theoretical_mw != null);
+  if (data.length < 2) {
+    return (
+      <section className="performance-card comparison-chart-card">
+        <div className="section-bar"><div><span className="section-index">01</span><strong>Actual vs theoretical output</strong></div></div>
+        <div className="chart-empty">At least two calculated readings are needed for comparison.</div>
+      </section>
+    );
+  }
+
+  const width = 960;
+  const height = 260;
+  const padding = { top: 22, right: 30, bottom: 42, left: 58 };
+  const times = data.map((reading) => new Date(reading.ts).getTime());
+  const values = data.flatMap((reading) => [reading.actual_mw, reading.theoretical_mw as number]);
+  const timeMin = Math.min(...times);
+  const timeMax = Math.max(...times);
+  const rawMin = Math.min(...values);
+  const rawMax = Math.max(...values);
+  const margin = Math.max(1, (rawMax - rawMin) * 0.12);
+  const valueMin = Math.max(0, rawMin - margin);
+  const valueMax = rawMax + margin;
+  const x = (time: number) => padding.left + (time - timeMin) / Math.max(1, timeMax - timeMin) * (width - padding.left - padding.right);
+  const y = (value: number) => padding.top + (valueMax - value) / Math.max(1, valueMax - valueMin) * (height - padding.top - padding.bottom);
+  const points = (key: "actual_mw" | "theoretical_mw") => data.map((reading) => `${x(new Date(reading.ts).getTime()).toFixed(2)},${y(reading[key] as number).toFixed(2)}`).join(" ");
+  const ticks = [0, 0.5, 1].map((ratio) => ({
+    y: padding.top + ratio * (height - padding.top - padding.bottom),
+    value: valueMax - ratio * (valueMax - valueMin),
+  }));
+  const latest = data.at(-1)!;
+  const timeLabel = (timestamp: number) => new Intl.DateTimeFormat("en", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "short" }).format(new Date(timestamp));
+
+  return (
+    <section className="performance-card comparison-chart-card">
+      <div className="section-bar">
+        <div><span className="section-index">01</span><strong>Actual vs theoretical output</strong></div>
+        <div className="chart-legend" aria-label="Chart legend"><span><i className="actual" />Actual {latest.actual_mw.toFixed(2)} MW</span><span><i className="theoretical" />Theoretical {(latest.theoretical_mw as number).toFixed(2)} MW</span></div>
+      </div>
+      <div className="comparison-chart-wrap">
+        <svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-labelledby="performance-chart-title performance-chart-description">
+          <title id="performance-chart-title">Actual versus theoretical generation output</title>
+          <desc id="performance-chart-description">Two lines compare actual and healthy-condition theoretical megawatt output over the returned reading period.</desc>
+          {ticks.map((tick) => <g key={tick.y}><line className="chart-grid" x1={padding.left} x2={width - padding.right} y1={tick.y} y2={tick.y} /><text className="chart-axis-label" x={padding.left - 10} y={tick.y + 4} textAnchor="end">{tick.value.toFixed(1)}</text></g>)}
+          <text className="chart-axis-label" x={padding.left} y={height - 12}>{timeLabel(timeMin)}</text>
+          <text className="chart-axis-label" x={width - padding.right} y={height - 12} textAnchor="end">{timeLabel(timeMax)}</text>
+          <text className="chart-axis-label chart-unit" x="13" y={padding.top - 6}>MW</text>
+          <polyline className="chart-line chart-theoretical" points={points("theoretical_mw")} />
+          <polyline className="chart-line chart-actual" points={points("actual_mw")} />
+        </svg>
       </div>
     </section>
   );

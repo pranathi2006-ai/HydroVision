@@ -1,0 +1,10 @@
+unit_id,flow_m3s,head_m,efficiency
+turbine_1,100,32,0.850
+turbine_1,100,36,0.875
+turbine_1,100,40,0.868
+turbine_1,160,32,0.890
+turbine_1,160,36,0.925
+turbine_1,160,40,0.910
+turbine_1,220,32,0.870
+turbine_1,220,36,0.900
+turbine_1,220,40,0.895

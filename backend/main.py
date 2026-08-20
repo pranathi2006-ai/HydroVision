@@ -20,6 +20,11 @@ from pydantic import BaseModel
 
 from .detector import Detection, LocalDetector
 from .performance import PerformanceIngestionService, PerformanceSettings, build_adapter
+from .reference_curves import (
+    PerformanceCalculationService,
+    PerformanceCurveModel,
+    import_reference_curves,
+)
 from .store import LOCATIONS, Store
 
 
@@ -37,10 +42,39 @@ ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-ms
 store = Store(DATA_DIR / "hydrovision.sqlite3")
 detector = LocalDetector()
 performance_settings = PerformanceSettings.from_env()
+reference_dataset = store.reference_curve_dataset()
+if reference_dataset is None:
+    if performance_settings.source != "mock":
+        raise RuntimeError(
+            "OEM reference curves are not loaded. Run scripts/import_reference_curves.py before starting the real source."
+        )
+    mock_curve_path = ROOT / "reference_curves" / "mock_design"
+    import_reference_curves(
+        store,
+        mock_curve_path,
+        dataset_name="bundled mock design curves",
+        is_demo=True,
+    )
+    reference_dataset = store.reference_curve_dataset()
+if (
+    performance_settings.source == "real"
+    and reference_dataset
+    and reference_dataset["is_demo"]
+):
+    raise RuntimeError(
+        "RealSourceAdapter cannot run with bundled mock reference curves. Import the plant OEM/design curves first."
+    )
+performance_calculation = PerformanceCalculationService(
+    store,
+    PerformanceCurveModel(store, performance_settings.unit_id),
+    nameplate_capacity_mw=performance_settings.nameplate_capacity_mw,
+)
+performance_backfill_summary = performance_calculation.backfill()
 performance_ingestion = PerformanceIngestionService(
     store,
     build_adapter(performance_settings),
     performance_settings,
+    performance_calculation,
 )
 
 allowed_origins = {
@@ -237,6 +271,10 @@ def health() -> dict:
         "video_sample_seconds": VIDEO_SAMPLE_SECONDS,
         "performance_source": performance_settings.source,
         "performance_poll_interval_seconds": performance_settings.effective_interval_seconds,
+        "performance_unit_id": performance_settings.unit_id,
+        "nameplate_capacity_mw": performance_settings.nameplate_capacity_mw,
+        "reference_curve_dataset": reference_dataset["dataset_name"] if reference_dataset else None,
+        "performance_backfill": performance_backfill_summary,
     }
 
 

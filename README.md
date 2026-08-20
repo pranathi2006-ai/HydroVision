@@ -5,9 +5,10 @@ hydropower equipment. It accepts images or video, detects corrosion and leaks,
 and keeps the plant map and findings register synchronized through one SQLite
 snapshot.
 
-Phase 1 operational data plumbing also records generation output, headwater,
-tailwater, and gate position through a pluggable source adapter. It performs no
-theoretical calculations, gap calculations, LLM calls, or VLM calls.
+The performance pipeline records generation output, headwater, tailwater, and
+gate position through a pluggable source adapter. Phase 2 uses static imported
+OEM/design curves to populate healthy-condition theoretical output and the raw
+performance gap. It makes no LLM or VLM calls.
 
 ## What is enforced
 
@@ -98,14 +99,44 @@ update interval, units, and physical validation limits with the controls team.
 interface is OPC-UA or a historian SDK, replace only that adapter's transport
 body and retain its `getLatestReading()` return contract.
 
-The canonical PostgreSQL DDL is in
-`backend/migrations/001_performance_reading.sql`. Local development creates the
-same columns in SQLite automatically; `theoretical_mw` and `gap_pct` remain
-`NULL` until Phase 2.
+The canonical PostgreSQL DDL is in `backend/migrations/`. Local development
+creates the same columns and reference-curve tables in SQLite automatically.
+
+## Phase 2 reference curves
+
+Reference values are not hardcoded in the calculation service. Import a JSON
+object or a directory containing these three editable CSV files:
+
+- `turbine_performance_curve.csv`
+- `gate_flow_curve.csv`
+- `hydraulic_loss_baseline.csv`
+
+The headers match the columns in `backend/migrations/002_reference_curves.sql`.
+Importing replaces the prior dataset atomically, validates complete grids and
+physical ranges, caches new SciPy interpolators, and recalculates every stored
+performance row:
+
+```bash
+python3 scripts/import_reference_curves.py /path/to/oem-curves \
+  --dataset-name "OEM hill curves revision C" \
+  --unit-id turbine_1 \
+  --nameplate-mw 75
+```
+
+The bundled `reference_curves/mock_design/` files exist only to exercise the
+mock adapter and verification chart. They are marked as demo data in the
+database and are refused when `HYDROVISION_PERFORMANCE_SOURCE=real`. Import the
+plant's OEM/design documents before activating the real source, then restart
+the backend so its in-memory interpolation cache uses the new dataset.
+
+New readings are calculated before insert. If a curve lookup is out of range or
+invalid, the reading is rejected and logged rather than stored with missing
+Phase 2 fields. Output above the configured nameplate capacity is logged and
+clamped before the gap is calculated.
 
 After the service has run continuously for a day, verify the operational exit
 criterion with:
 
 ```bash
-python3 scripts/check_performance_soak.py --hours 24 --interval-seconds 300
+python3 scripts/check_performance_soak.py --hours 24 --interval-seconds 300 --nameplate-mw 75
 ```

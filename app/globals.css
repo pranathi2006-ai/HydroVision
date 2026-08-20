@@ -81,5 +81,15 @@ button { color: inherit; }
 .performance-table td b { font-size: 13px; }
 .performance-empty { min-height: 310px; display: grid; place-content: center; text-align: center; gap: 7px; color: var(--muted); }
 .performance-empty b { color: var(--ink); font-size: 12px; }.performance-empty span { font-size: 10px; }
+.comparison-chart-card { min-height: 0; }
+.comparison-chart-wrap { padding: 12px 16px 5px; }
+.comparison-chart { display: block; width: 100%; height: auto; overflow: visible; }
+.chart-grid { stroke: var(--line); stroke-width: 1; }
+.chart-axis-label { fill: var(--muted); font: 10px monospace; }
+.chart-unit { font-weight: 800; }
+.chart-line { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.chart-actual { stroke: var(--green); }.chart-theoretical { stroke: var(--orange); }
+.chart-legend { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 9px; }.chart-legend span { display: flex; align-items: center; gap: 6px; }.chart-legend i { width: 18px; border-top: 2px solid; }.chart-legend .actual { border-color: var(--green); }.chart-legend .theoretical { border-color: var(--orange); }
+.chart-empty { min-height: 180px; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
 @media (max-width: 900px) { .performance-metrics { grid-template-columns: repeat(2, 1fr); }.performance-metrics .metric:nth-child(2) { border-right: 0; }.performance-metrics .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); } }
-@media (max-width: 560px) { .performance-metrics { grid-template-columns: 1fr; }.performance-metrics .metric { border-right: 0; border-bottom: 1px solid var(--line); }.performance-metrics .metric:last-child { border-bottom: 0; }.poll-cadence { display: none; } }
+@media (max-width: 560px) { .performance-metrics { grid-template-columns: 1fr; }.performance-metrics .metric { border-right: 0; border-bottom: 1px solid var(--line); }.performance-metrics .metric:last-child { border-bottom: 0; }.poll-cadence { display: none; }.chart-legend { gap: 7px; font-size: 8px; }.chart-legend i { width: 10px; } }

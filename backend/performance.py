@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
+from .reference_curves import PerformanceCalculationError, PerformanceCalculationService
 from .store import Store
 
 
@@ -142,6 +143,8 @@ class RealSourceAdapter:
 @dataclass(frozen=True)
 class PerformanceSettings:
     source: str = "mock"
+    unit_id: str = "turbine_1"
+    nameplate_capacity_mw: float = 75
     poll_interval_seconds: int = 300
     source_update_seconds: int = 300
     headwater_min: float = 0
@@ -161,6 +164,8 @@ class PerformanceSettings:
     def from_env(cls) -> "PerformanceSettings":
         return cls(
             source=os.getenv("HYDROVISION_PERFORMANCE_SOURCE", "mock").strip().lower(),
+            unit_id=os.getenv("HYDROVISION_UNIT_ID", "turbine_1").strip(),
+            nameplate_capacity_mw=float(os.getenv("HYDROVISION_NAMEPLATE_CAPACITY_MW", "75")),
             poll_interval_seconds=max(1, int(os.getenv("HYDROVISION_PERFORMANCE_POLL_SECONDS", "300"))),
             source_update_seconds=max(1, int(os.getenv("HYDROVISION_SOURCE_UPDATE_SECONDS", "300"))),
             headwater_min=float(os.getenv("HYDROVISION_HEADWATER_MIN", "0")),
@@ -200,10 +205,12 @@ class PerformanceIngestionService:
         store: Store,
         adapter: SourceAdapter,
         settings: PerformanceSettings,
+        calculator: PerformanceCalculationService,
     ) -> None:
         self.store = store
         self.adapter = adapter
         self.settings = settings
+        self.calculator = calculator
         self._task: asyncio.Task[None] | None = None
         self._warned_gap_after: datetime | None = None
 
@@ -274,13 +281,25 @@ class PerformanceIngestionService:
 
         assert reading.ts is not None
         self._log_gap_if_needed(reading.ts, last_successful)
-        reading_id = self.store.insert_performance_reading(reading)
+        try:
+            calculated = self.calculator.calculate(reading)
+        except PerformanceCalculationError as error:
+            logger.error(
+                "performance reading rejected because Phase 2 calculation failed adapter=%s error=%s reading=%s",
+                type(self.adapter).__name__,
+                error,
+                asdict(reading),
+            )
+            return False
+        reading_id = self.store.insert_performance_reading(reading, calculated)
         self._warned_gap_after = None
         logger.info(
-            "performance reading stored reading_id=%s ts=%s actual_mw=%.3f headwater_level=%.3f tailwater_level=%.3f gate_position=%.2f adapter=%s",
+            "performance reading stored reading_id=%s ts=%s actual_mw=%.3f theoretical_mw=%.3f gap_pct=%.3f headwater_level=%.3f tailwater_level=%.3f gate_position=%.2f adapter=%s",
             reading_id,
             reading.ts.isoformat(),
             reading.actual_mw,
+            calculated.theoretical_mw,
+            calculated.gap_pct,
             reading.headwater_level,
             reading.tailwater_level,
             reading.gate_position,

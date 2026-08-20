@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
     from .performance import PerformanceReading
+    from .reference_curves import CalculatedPerformance
 
 
 LOCATIONS = [
@@ -88,6 +89,37 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS performance_reading_ts_idx
                     ON performance_reading(ts);
+                CREATE TABLE IF NOT EXISTS turbine_performance_curve (
+                    point_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    unit_id TEXT NOT NULL,
+                    flow_m3s REAL NOT NULL,
+                    head_m REAL NOT NULL,
+                    efficiency REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS gate_flow_curve (
+                    point_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    gate_position REAL NOT NULL,
+                    head_m REAL NOT NULL,
+                    flow_m3s REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS hydraulic_loss_baseline (
+                    point_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    flow_m3s REAL NOT NULL,
+                    loss_m REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reference_curve_dataset (
+                    dataset_id INTEGER PRIMARY KEY CHECK (dataset_id = 1),
+                    dataset_name TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    is_demo INTEGER NOT NULL DEFAULT 0,
+                    imported_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS turbine_curve_point_idx
+                    ON turbine_performance_curve(unit_id, flow_m3s, head_m);
+                CREATE UNIQUE INDEX IF NOT EXISTS gate_curve_point_idx
+                    ON gate_flow_curve(gate_position, head_m);
+                CREATE UNIQUE INDEX IF NOT EXISTS loss_curve_point_idx
+                    ON hydraulic_loss_baseline(flow_m3s);
                 """
             )
             media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
@@ -103,7 +135,11 @@ class Store:
         with self.connect() as db:
             db.execute("UPDATE media SET cleared_at = NULL WHERE id = ?", (media_id,))
 
-    def insert_performance_reading(self, reading: "PerformanceReading") -> int:
+    def insert_performance_reading(
+        self,
+        reading: "PerformanceReading",
+        calculated: "CalculatedPerformance",
+    ) -> int:
         assert reading.ts is not None
         with self.connect() as db:
             cursor = db.execute(
@@ -111,17 +147,48 @@ class Store:
                 INSERT INTO performance_reading (
                     ts, headwater_level, tailwater_level, gate_position,
                     theoretical_mw, actual_mw, gap_pct
-                ) VALUES (?, ?, ?, ?, NULL, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     reading.ts.astimezone(timezone.utc).isoformat(),
                     reading.headwater_level,
                     reading.tailwater_level,
                     reading.gate_position,
+                    calculated.theoretical_mw,
                     reading.actual_mw,
+                    calculated.gap_pct,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def update_performance_calculation(
+        self,
+        reading_id: int,
+        calculated: "CalculatedPerformance",
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE performance_reading
+                SET theoretical_mw = ?, gap_pct = ?
+                WHERE reading_id = ?
+                """,
+                (calculated.theoretical_mw, calculated.gap_pct, reading_id),
+            )
+
+    def performance_readings_for_calculation(self, *, only_missing: bool) -> list[dict]:
+        where = "WHERE theoretical_mw IS NULL OR gap_pct IS NULL" if only_missing else ""
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT reading_id, ts, headwater_level, tailwater_level,
+                       gate_position, theoretical_mw, actual_mw, gap_pct
+                FROM performance_reading
+                {where}
+                ORDER BY ts ASC, reading_id ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def latest_performance_timestamp(self) -> datetime | None:
         with self.connect() as db:
@@ -144,6 +211,77 @@ class Store:
                 (since_utc,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def reference_curve_dataset(self) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM reference_curve_dataset WHERE dataset_id = 1").fetchone()
+        return dict(row) if row else None
+
+    def reference_curve_rows(self) -> dict[str, list[dict]]:
+        with self.connect() as db:
+            turbine = db.execute(
+                "SELECT unit_id, flow_m3s, head_m, efficiency FROM turbine_performance_curve"
+            ).fetchall()
+            gate = db.execute(
+                "SELECT gate_position, head_m, flow_m3s FROM gate_flow_curve"
+            ).fetchall()
+            loss = db.execute(
+                "SELECT flow_m3s, loss_m FROM hydraulic_loss_baseline ORDER BY flow_m3s"
+            ).fetchall()
+        return {
+            "turbine": [dict(row) for row in turbine],
+            "gate": [dict(row) for row in gate],
+            "loss": [dict(row) for row in loss],
+        }
+
+    def replace_reference_curves(
+        self,
+        turbine: list[dict],
+        gate: list[dict],
+        loss: list[dict],
+        *,
+        dataset_name: str,
+        source_path: str,
+        is_demo: bool,
+    ) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM turbine_performance_curve")
+            db.execute("DELETE FROM gate_flow_curve")
+            db.execute("DELETE FROM hydraulic_loss_baseline")
+            db.executemany(
+                """
+                INSERT INTO turbine_performance_curve (unit_id, flow_m3s, head_m, efficiency)
+                VALUES (:unit_id, :flow_m3s, :head_m, :efficiency)
+                """,
+                turbine,
+            )
+            db.executemany(
+                """
+                INSERT INTO gate_flow_curve (gate_position, head_m, flow_m3s)
+                VALUES (:gate_position, :head_m, :flow_m3s)
+                """,
+                gate,
+            )
+            db.executemany(
+                """
+                INSERT INTO hydraulic_loss_baseline (flow_m3s, loss_m)
+                VALUES (:flow_m3s, :loss_m)
+                """,
+                loss,
+            )
+            db.execute(
+                """
+                INSERT INTO reference_curve_dataset (
+                    dataset_id, dataset_name, source_path, is_demo, imported_at
+                ) VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(dataset_id) DO UPDATE SET
+                    dataset_name = excluded.dataset_name,
+                    source_path = excluded.source_path,
+                    is_demo = excluded.is_demo,
+                    imported_at = excluded.imported_at
+                """,
+                (dataset_name, source_path, int(is_demo), utc_now()),
+            )
 
     def insert_media(self, **values) -> int:
         with self.connect() as db:
