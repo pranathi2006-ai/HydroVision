@@ -5,10 +5,18 @@ import re
 
 import cv2
 import numpy as np
+from fastapi import Response
 from PIL import Image, ImageDraw
 
 from backend.detector import LocalDetector
-from backend.main import LAN_ORIGIN_REGEX, MAX_LONG_EDGE, VIDEO_SAMPLE_SECONDS, normalize_image
+from backend.main import (
+    LAN_ORIGIN_REGEX,
+    MAX_LONG_EDGE,
+    VIDEO_SAMPLE_SECONDS,
+    current_dashboard,
+    normalize_image,
+    performance_settings,
+)
 
 
 def test_resize_is_enforced() -> None:
@@ -28,6 +36,18 @@ def test_private_network_origins_are_allowed_without_open_public_cors() -> None:
     assert re.fullmatch(LAN_ORIGIN_REGEX, "http://192.168.1.42:3000")
     assert re.fullmatch(LAN_ORIGIN_REGEX, "http://10.0.0.8:3000")
     assert not re.fullmatch(LAN_ORIGIN_REGEX, "https://example.com")
+
+
+def test_current_dashboard_endpoint_uses_ingestion_cadence_and_six_sites() -> None:
+    response = Response()
+
+    payload = current_dashboard(response)
+
+    assert response.headers["X-Poll-Interval-Seconds"] == str(
+        performance_settings.effective_interval_seconds
+    )
+    assert payload["poll_interval_seconds"] == performance_settings.effective_interval_seconds
+    assert len(payload["sites"]) == 6
 
 
 def test_known_corrosion_patch_returns_bbox_and_confidence() -> None:

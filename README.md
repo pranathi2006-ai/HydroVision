@@ -192,3 +192,23 @@ Use `grid_connection` if that is the real boundary; transformer loss then needs
 a separately scoped design. Transformer thermal events are never candidates in
 the Phase 4 hydraulic ranking. Query a ranked result with
 `GET /api/performance/attribution?reading_id=<id>`.
+
+## Phase 5 unified dashboard
+
+`GET /api/dashboard/current` returns one coherent snapshot: the latest
+performance reading, its stored Phase 4 attribution rows, the latest Phase 3
+detection event for each of the six sites, and the matching static recommended
+actions. The map and energy waterfall consume that response through one shared
+hook and one shared selected-site state, so neither view performs a separate
+query or derives new attribution.
+
+The response advertises the Phase 1 cadence in
+`X-Poll-Interval-Seconds`; the dashboard uses that interval and never polls
+faster than once per minute. Waterfall segments use the stored
+`estimated_loss_mw` values, keep generator-terminal transformer scope explicit,
+and render any unattributed residual as a distinct `Unexplained` segment.
+
+The `recommended_action` table is created and seeded by
+`backend/migrations/005_dashboard_recommendations.sql`. Recommendations are
+static lookups only. Selecting a marker or waterfall segment opens the same
+evidence detail panel and does not trigger an LLM request.

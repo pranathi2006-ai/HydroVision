@@ -40,6 +40,25 @@ SITE_SENSORS = [
     ("draft_tube_camera", "draft_tube", "camera"),
 ]
 
+SITE_LAYOUT = {
+    "turbine_1": {"zone": "Powerhouse 01", "x": 24, "y": 61},
+    "turbine_2": {"zone": "Powerhouse 02", "x": 51, "y": 61},
+    "main_transformer": {"zone": "Switchyard", "x": 78, "y": 31},
+    "intake_gate": {"zone": "Upper intake", "x": 15, "y": 23},
+    "penstock_valve": {"zone": "Valve gallery", "x": 42, "y": 28},
+    "draft_tube": {"zone": "Lower gallery", "x": 71, "y": 75},
+}
+
+RECOMMENDED_ACTIONS = [
+    ("trash_rack_blockage", "Schedule rack cleaning; re-check generation gap after cleaning."),
+    ("gate_position_mismatch", "Inspect gate actuator and position calibration; verify commanded versus visual position."),
+    ("oil_leak", "Isolate and inspect the leak source; repair seals and confirm flow recovery."),
+    ("corrosion", "Inspect the affected surface, remove corrosion, and assess remaining thickness."),
+    ("cavitation_wear", "Schedule turbine inspection and inspect runner surfaces for cavitation pitting."),
+    ("draft_tube_blockage", "Inspect and clear the draft-tube obstruction; verify tailrace flow afterward."),
+    ("thermal_hotspot", "Inspect transformer cooling and load connections; confirm with a calibrated thermal scan."),
+]
+
 ATTRIBUTION_RULES = [
     {
         "rule_id": "trash_rack_blockage",
@@ -294,6 +313,10 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS loss_attribution_reading_rank_idx
                     ON loss_attribution(reading_id, estimated_loss_mw DESC);
+                CREATE TABLE IF NOT EXISTS recommended_action (
+                    defect_type TEXT PRIMARY KEY,
+                    default_recommendation TEXT NOT NULL
+                );
                 """
             )
             media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
@@ -319,6 +342,14 @@ class Store:
                         json.dumps(rule["params"], sort_keys=True), rule["confidence"],
                     ),
                 )
+            db.executemany(
+                """
+                INSERT OR IGNORE INTO recommended_action (
+                    defect_type, default_recommendation
+                ) VALUES (?, ?)
+                """,
+                RECOMMENDED_ACTIONS,
+            )
 
     def cached_media(self, content_hash: str) -> dict | None:
         with self.connect() as db:
@@ -722,6 +753,119 @@ class Store:
                 (reading_id,),
             ).fetchall()
         return [{**dict(row), "rank": index + 1} for index, row in enumerate(rows)]
+
+    def current_dashboard(self) -> dict:
+        """Return one transactionally consistent read model for both Phase 5 views."""
+        with self.connect() as db:
+            db.execute("BEGIN")
+            reading_row = db.execute(
+                """
+                SELECT reading_id, ts, headwater_level, tailwater_level,
+                       gate_position, theoretical_mw, actual_mw, gap_pct
+                FROM performance_reading
+                ORDER BY ts DESC, reading_id DESC LIMIT 1
+                """
+            ).fetchone()
+            reading = dict(reading_row) if reading_row else None
+            run = None
+            attribution_rows: list[sqlite3.Row] = []
+            if reading is not None:
+                run = db.execute(
+                    "SELECT * FROM attribution_run WHERE reading_id = ?",
+                    (reading["reading_id"],),
+                ).fetchone()
+                attribution_rows = db.execute(
+                    """
+                    SELECT l.*, e.ts AS event_ts, e.sensor_id, e.detection_type,
+                           e.defect_present, e.severity, e.confidence AS event_confidence,
+                           e.measurement, e.bbox_json, m.stored_name
+                    FROM loss_attribution l
+                    JOIN detection_event e ON e.event_id = l.event_id
+                    LEFT JOIN media m ON m.id = e.media_id
+                    WHERE l.reading_id = ?
+                    ORDER BY l.estimated_loss_mw DESC, l.confidence DESC, l.attribution_id
+                    """,
+                    (reading["reading_id"],),
+                ).fetchall()
+
+            latest_rows = db.execute(
+                """
+                SELECT e.*, m.stored_name
+                FROM detection_event e
+                LEFT JOIN media m ON m.id = e.media_id
+                ORDER BY e.ts DESC, e.event_id DESC
+                """
+            ).fetchall()
+            action_rows = db.execute(
+                "SELECT defect_type, default_recommendation FROM recommended_action"
+            ).fetchall()
+
+        actions = {row["defect_type"]: row["default_recommendation"] for row in action_rows}
+        latest_by_asset: dict[str, dict] = {}
+        for row in latest_rows:
+            event = self._dashboard_event_dict(row)
+            latest_by_asset.setdefault(event["asset_id"], event)
+
+        attribution_by_asset: dict[str, dict] = {}
+        for rank, row in enumerate(attribution_rows, start=1):
+            item = dict(row)
+            item["rank"] = rank
+            item["method"] = str(item["method"])
+            item["event"] = {
+                "event_id": item["event_id"],
+                "ts": item.pop("event_ts"),
+                "asset_id": item["asset_id"],
+                "sensor_id": item.pop("sensor_id"),
+                "detection_type": item.pop("detection_type"),
+                "defect_present": bool(item.pop("defect_present")),
+                "severity": item.pop("severity"),
+                "confidence": item.pop("event_confidence"),
+                "measurement": json.loads(item.pop("measurement")),
+                "bbox": json.loads(item.pop("bbox_json")) if item.get("bbox_json") else None,
+                "thumbnail_url": f"/api/media/{item['stored_name']}" if item.get("stored_name") else None,
+            }
+            item.pop("bbox_json", None)
+            item.pop("stored_name", None)
+            attribution_by_asset[item["asset_id"]] = item
+
+        sites = []
+        for asset_id, name, asset_type in SITE_ASSETS:
+            latest = latest_by_asset.get(asset_id)
+            attribution = attribution_by_asset.get(asset_id)
+            recommendation_type = (
+                latest["detection_type"] if latest else
+                attribution["event"]["detection_type"] if attribution else None
+            )
+            sites.append({
+                "asset_id": asset_id,
+                "name": name,
+                "asset_type": asset_type,
+                **SITE_LAYOUT[asset_id],
+                "latest_event": latest,
+                "attribution": attribution,
+                "recommended_action": actions.get(recommendation_type) if recommendation_type else None,
+            })
+
+        sites.sort(key=lambda site: (
+            -(site["attribution"]["estimated_loss_mw"] if site["attribution"] else 0),
+            site["name"],
+        ))
+        return {
+            "reading": reading,
+            "attribution_status": dict(run)["status"] if run else "not_triggered",
+            "sites": sites,
+        }
+
+    @staticmethod
+    def _dashboard_event_dict(row: sqlite3.Row) -> dict:
+        event = dict(row)
+        bbox_json = event.pop("bbox_json")
+        stored_name = event.pop("stored_name")
+        event["defect_present"] = bool(event["defect_present"])
+        event["measurement"] = json.loads(event["measurement"])
+        event["bbox"] = json.loads(bbox_json) if bbox_json else None
+        event["thumbnail_url"] = f"/api/media/{stored_name}" if stored_name else None
+        return event
 
     def latest_detection_event(self, asset_id: str, detection_type: str) -> dict | None:
         with self.connect() as db:

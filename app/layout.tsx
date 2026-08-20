@@ -19,14 +19,14 @@ export async function generateMetadata(): Promise<Metadata> {
   const privateHost = /^(?:localhost|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(host);
   const protocol = requestHeaders.get("x-forwarded-proto") ?? (privateHost ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "HydroVision — Visual Inspection & Digital Twin";
-  const description = "Local-first hydropower equipment inspection for leaks, corrosion and visual evidence.";
+  const title = "HydroVision — Condition & Energy Impact";
+  const description = "One synchronized hydropower dashboard connecting six-site condition evidence to ranked megawatt impact.";
   return {
     title,
     description,
     icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
-    openGraph: { title, description, images: [{ url: `${origin}/og.png`, width: 1200, height: 630 }] },
-    twitter: { card: "summary_large_image", title, description, images: [`${origin}/og.png`] },
+    openGraph: { title, description, images: [{ url: `${origin}/og-phase5.png`, width: 1200, height: 630 }] },
+    twitter: { card: "summary_large_image", title, description, images: [`${origin}/og-phase5.png`] },
   };
 }
 

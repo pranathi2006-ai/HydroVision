@@ -350,6 +350,19 @@ def performance_attribution(reading_id: int = Query(..., gt=0)) -> list[dict]:
     return store.loss_attributions(reading_id)
 
 
+@app.get("/api/dashboard/current")
+def current_dashboard(response: Response) -> dict:
+    response.headers["X-Poll-Interval-Seconds"] = str(
+        performance_settings.effective_interval_seconds
+    )
+    return {
+        **store.current_dashboard(),
+        "poll_interval_seconds": performance_settings.effective_interval_seconds,
+        "gap_threshold_pct": attribution_settings.threshold_pct,
+        "actual_mw_meter_location": attribution_settings.meter_location,
+    }
+
+
 @app.get("/api/snapshot")
 def snapshot() -> dict:
     return store.snapshot()

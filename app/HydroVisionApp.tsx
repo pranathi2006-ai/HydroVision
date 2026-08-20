@@ -68,6 +68,42 @@ type LossAttribution = {
   method: "rule_based";
 };
 
+type DetectionEvent = {
+  event_id: number;
+  ts: string;
+  asset_id: string;
+  sensor_id: string;
+  detection_type: string;
+  defect_present: boolean;
+  severity: Severity;
+  confidence: number | null;
+  measurement: Record<string, unknown>;
+  thumbnail_url: string | null;
+};
+
+type CurrentAttribution = LossAttribution & { event: DetectionEvent };
+
+type DashboardSite = {
+  asset_id: string;
+  name: string;
+  asset_type: string;
+  zone: string;
+  x: number;
+  y: number;
+  latest_event: DetectionEvent | null;
+  attribution: CurrentAttribution | null;
+  recommended_action: string | null;
+};
+
+type CurrentDashboard = {
+  reading: PerformanceReading | null;
+  attribution_status: "attributed" | "unexplained" | "not_triggered";
+  sites: DashboardSite[];
+  poll_interval_seconds: number;
+  gap_threshold_pct: number;
+  actual_mw_meter_location: "generator_terminal" | "grid_connection" | "unconfirmed";
+};
+
 type View = "twin" | "findings" | "performance";
 
 const EMPTY: Snapshot = {
@@ -90,6 +126,34 @@ function mediaUrl(path?: string) {
   return path ? `${API}${path}` : "";
 }
 
+function useCurrentDashboard() {
+  const [data, setData] = useState<CurrentDashboard | null>(null);
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [pollSeconds, setPollSeconds] = useState(INITIAL_PERFORMANCE_POLL_SECONDS);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const response = await fetch(`${API}/api/dashboard/current`);
+        if (!response.ok) throw new Error("Dashboard service unavailable");
+        const current: CurrentDashboard = await response.json();
+        if (cancelled) return;
+        setData(current);
+        setPollSeconds(Math.max(60, current.poll_interval_seconds || INITIAL_PERFORMANCE_POLL_SECONDS));
+        setConnected(true);
+      } catch {
+        if (!cancelled) setConnected(false);
+      }
+    }
+    void load();
+    const timer = window.setInterval(() => void load(), pollSeconds * 1000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [pollSeconds]);
+
+  return { data, connected, pollSeconds };
+}
+
 function relativeDate(value: string) {
   const minutes = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60_000));
   if (minutes < 2) return "Just now";
@@ -103,6 +167,7 @@ function titleCase(value: string) {
 }
 
 export function HydroVisionApp() {
+  const currentDashboard = useCurrentDashboard();
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY);
   const [activeView, setActiveView] = useState<View>("twin");
   const [performanceReadings, setPerformanceReadings] = useState<PerformanceReading[]>([]);
@@ -111,7 +176,7 @@ export function HydroVisionApp() {
   const [attributionThreshold, setAttributionThreshold] = useState(5);
   const [attributionEnabled, setAttributionEnabled] = useState(true);
   const [lossAttributions, setLossAttributions] = useState<Record<number, LossAttribution[]>>({});
-  const [selectedLocation, setSelectedLocation] = useState<string>("turbine-a");
+  const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [connected, setConnected] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -179,7 +244,6 @@ export function HydroVisionApp() {
     return () => window.clearInterval(timer);
   }, [performancePollSeconds]);
 
-  const selected = snapshot.locations.find((item) => item.id === selectedLocation) ?? snapshot.locations[0];
   const filteredFindings = useMemo(() => {
     const term = query.trim().toLowerCase();
     return snapshot.findings.filter((finding) => {
@@ -189,7 +253,7 @@ export function HydroVisionApp() {
     });
   }, [query, severityFilter, snapshot.findings]);
   const viewCopy = activeView === "twin"
-    ? ["LIVE ASSET OVERVIEW", "Plant condition", "One synchronized view of visual risk across monitored equipment."]
+    ? ["PHASE 5 · UNIFIED OPERATIONS", "Condition and energy impact", "One current dataset rendered as a spatial twin and an energy-loss waterfall."]
     : activeView === "findings"
       ? ["INSPECTION REGISTER", "All findings", "Filter and export every detection from one source of truth."]
       : ["PHASE 4 · RULE ATTRIBUTION", "Operational performance", "Raw readings, healthy-output comparison, and evidence-linked likely contributors."];
@@ -259,11 +323,18 @@ export function HydroVisionApp() {
             </div>
             <div className="date-block">
               <span>LAST SYNC</span>
-              <strong>{(activeView === "performance" ? performanceConnected : connected) ? "NOW" : "WAITING"}</strong>
+              <strong>{(activeView === "performance" ? performanceConnected : activeView === "twin" ? currentDashboard.connected : connected) ? "NOW" : "WAITING"}</strong>
             </div>
           </section>
 
-          {activeView !== "performance" && (
+          {activeView === "twin" && (
+            <section className="metrics" aria-label="Current generation summary">
+              <Metric value={formatReading(currentDashboard.data?.reading?.theoretical_mw ?? null, 2)} label="Healthy output" detail="MW · theoretical" />
+              <Metric value={formatReading(currentDashboard.data?.reading?.actual_mw ?? null, 2)} label="Current output" detail="MW · actual" />
+              <Metric value={formatReading(currentDashboard.data?.reading?.gap_pct ?? null, 2)} label="Generation gap" detail="% · latest reading" urgent={(currentDashboard.data?.reading?.gap_pct ?? 0) > (currentDashboard.data?.gap_threshold_pct ?? 5)} />
+            </section>
+          )}
+          {activeView === "findings" && (
             <section className="metrics" aria-label="Plant condition summary">
               <Metric value={snapshot.metrics.monitored_locations} label="Locations monitored" detail="6 plant zones" />
               <Metric value={snapshot.metrics.active_findings} label="Active findings" detail={`${snapshot.findings.length} total recorded`} />
@@ -271,18 +342,17 @@ export function HydroVisionApp() {
             </section>
           )}
 
-          {(activeView === "performance" ? performanceConnected : connected) === false && (
+          {(activeView === "performance" ? performanceConnected : activeView === "twin" ? currentDashboard.connected : connected) === false && (
             <div className="offline-banner"><strong>Local service is offline.</strong> Start the backend on port 8001 to view live plant data.</div>
           )}
           {actionNotice && <div className="action-notice" role="status"><span>{actionNotice}</span><button onClick={() => setActionNotice("")} aria-label="Dismiss message">×</button></div>}
 
           {activeView === "twin" ? (
-            <TwinView
-              locations={snapshot.locations}
-              findings={snapshot.findings}
-              selected={selected}
-              onSelect={setSelectedLocation}
-              onShowFindings={() => setActiveView("findings")}
+            <UnifiedOperationsView
+              dashboard={currentDashboard.data}
+              selectedAssetId={selectedAssetId}
+              onSelect={setSelectedAssetId}
+              pollSeconds={currentDashboard.pollSeconds}
             />
           ) : activeView === "findings" ? (
             <FindingsView
@@ -308,7 +378,10 @@ export function HydroVisionApp() {
       {uploadOpen && (
         <UploadDrawer
           locations={snapshot.locations}
-          defaultLocation={selected?.id || "turbine-a"}
+          defaultLocation={({
+            turbine_1: "turbine-a", turbine_2: "turbine-b", main_transformer: "transformer",
+            intake_gate: "intake", penstock_valve: "penstock", draft_tube: "draft-tube",
+          } as Record<string, string>)[selectedAssetId || ""] || "turbine-a"}
           busy={busy}
           notice={notice}
           onClose={() => { if (!busy) setUploadOpen(false); }}
@@ -360,79 +433,218 @@ function Metric({ value, label, detail, urgent = false }: { value: string | numb
   );
 }
 
-function TwinView({ locations, findings, selected, onSelect, onShowFindings }: {
-  locations: Location[];
-  findings: Finding[];
-  selected?: Location;
-  onSelect: (id: string) => void;
-  onShowFindings: () => void;
+function siteCondition(site: DashboardSite): Severity {
+  if (site.attribution) return "critical";
+  const event = site.latest_event;
+  if (!event || !event.defect_present) return "normal";
+  if (event.severity === "critical" || (event.confidence ?? 0) >= 0.85) return "critical";
+  return event.severity === "normal" ? "observation" : event.severity;
+}
+
+function measurementSummary(measurement: Record<string, unknown>) {
+  const candidates: Array<[string, string, string]> = [
+    ["blockage_pct", "Blockage", "%"],
+    ["delta_t_c", "Thermal delta", " °C"],
+    ["mismatch_pct_points", "Gate mismatch", " points"],
+    ["visual_gate_position_pct", "Observed gate", "% open"],
+    ["pitting_area_pct", "Pitting area", "%"],
+    ["affected_area_pct", "Affected area", "%"],
+  ];
+  for (const [key, label, suffix] of candidates) {
+    const value = measurement[key];
+    if (typeof value === "number") return `${label}: ${value.toFixed(2)}${suffix}`;
+  }
+  return "No quantitative measurement recorded";
+}
+
+function UnifiedOperationsView({ dashboard, selectedAssetId, onSelect, pollSeconds }: {
+  dashboard: CurrentDashboard | null;
+  selectedAssetId: string | null;
+  onSelect: (assetId: string | null) => void;
+  pollSeconds: number;
+}) {
+  if (!dashboard) {
+    return <div className="unified-empty"><b>Waiting for the current plant snapshot</b><span>The map and waterfall will load together.</span></div>;
+  }
+  const selectedSite = dashboard.sites.find((site) => site.asset_id === selectedAssetId) || null;
+  return (
+    <>
+      <section className="unified-layout">
+        <SpatialTwin sites={dashboard.sites} selectedAssetId={selectedAssetId} onSelect={onSelect} />
+        <EnergyWaterfall dashboard={dashboard} selectedAssetId={selectedAssetId} onSelect={onSelect} pollSeconds={pollSeconds} />
+      </section>
+      {selectedSite && <SiteDetailPanel site={selectedSite} onClose={() => onSelect(null)} />}
+    </>
+  );
+}
+
+function SpatialTwin({ sites, selectedAssetId, onSelect }: {
+  sites: DashboardSite[];
+  selectedAssetId: string | null;
+  onSelect: (assetId: string) => void;
 }) {
   return (
-    <section className="twin-layout">
-      <div className="twin-card">
-        <div className="section-bar">
-          <div><span className="section-index">01</span><strong>Digital twin</strong></div>
-          <div className="legend"><span><i className="normal" /> Normal</span><span><i className="observation" /> Observe</span><span><i className="warning" /> Warning</span><span><i className="critical" /> Critical</span></div>
-        </div>
-        <div className="plant-map">
-          <div className="terrain-line line-a" /><div className="terrain-line line-b" /><div className="terrain-line line-c" />
-          <div className="water-channel"><span>FOREBAY</span></div>
-          <div className="penstock-line" />
-          <div className="powerhouse"><span>POWERHOUSE</span><i /><i /><i /></div>
-          <div className="switchyard"><span>SWITCHYARD</span><i /><i /><i /><i /></div>
-          <div className="tailrace"><span>TAILRACE</span></div>
-          {locations.map((location, index) => (
+    <div className="twin-card phase5-twin">
+      <div className="section-bar">
+        <div><span className="section-index">01</span><strong>Spatial condition</strong></div>
+        <div className="legend"><span><i className="normal" /> Healthy</span><span><i className="warning" /> Inspect</span><span><i className="critical" /> Gap contributor</span></div>
+      </div>
+      <div className="plant-map">
+        <div className="terrain-line line-a" /><div className="terrain-line line-b" /><div className="terrain-line line-c" />
+        <div className="water-channel"><span>FOREBAY</span></div>
+        <div className="penstock-line" />
+        <div className="powerhouse"><span>POWERHOUSE</span><i /><i /><i /></div>
+        <div className="switchyard"><span>SWITCHYARD</span><i /><i /><i /><i /></div>
+        <div className="tailrace"><span>TAILRACE</span></div>
+        {sites.map((site, index) => {
+          const condition = siteCondition(site);
+          return (
             <button
-              key={location.id}
-              className={`map-marker ${location.status} ${selected?.id === location.id ? "selected" : ""}`}
-              style={{ left: `${location.x}%`, top: `${location.y}%` }}
-              onClick={() => onSelect(location.id)}
-              aria-label={`${location.name}: ${location.status}`}
+              key={site.asset_id}
+              className={`map-marker ${condition} ${selectedAssetId === site.asset_id ? "selected" : ""} ${site.attribution ? "contributor" : ""}`}
+              style={{ left: `${site.x}%`, top: `${site.y}%` }}
+              onClick={() => onSelect(site.asset_id)}
+              aria-pressed={selectedAssetId === site.asset_id}
+              aria-label={`${site.name}: ${condition}${site.attribution ? `, ${site.attribution.estimated_loss_mw.toFixed(2)} megawatts estimated impact` : ""}`}
             >
               <b>{String(index + 1).padStart(2, "0")}</b>
-              <span>{location.name}</span>
+              <span>{site.name}</span>
+              {site.attribution && <em>{site.attribution.estimated_loss_mw.toFixed(2)} MW</em>}
+            </button>
+          );
+        })}
+        <div className="map-scale"><span>0</span><i /><span>50 M</span></div>
+      </div>
+      <div className="map-rank-strip">
+        {sites.map((site) => (
+          <button key={site.asset_id} className={selectedAssetId === site.asset_id ? "selected" : ""} onClick={() => onSelect(site.asset_id)}>
+            <span className={`condition-dot ${siteCondition(site)}`} />
+            <strong>{site.name}</strong>
+            <small>{site.attribution ? `${site.attribution.estimated_loss_mw.toFixed(2)} MW` : "No current impact"}</small>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EnergyWaterfall({ dashboard, selectedAssetId, onSelect, pollSeconds }: {
+  dashboard: CurrentDashboard;
+  selectedAssetId: string | null;
+  onSelect: (assetId: string) => void;
+  pollSeconds: number;
+}) {
+  const reading = dashboard.reading;
+  if (!reading || reading.theoretical_mw == null) {
+    return <section className="waterfall-card"><div className="section-bar"><div><span className="section-index">02</span><strong>Energy waterfall</strong></div></div><div className="waterfall-empty">Waiting for a calculated performance reading.</div></section>;
+  }
+  const theoretical = reading.theoretical_mw;
+  const actual = reading.actual_mw;
+  const scale = 180 / Math.max(theoretical, 1);
+  const hydraulic = dashboard.sites
+    .filter((site) => site.asset_id !== "main_transformer")
+    .slice()
+    .sort((left, right) => (right.attribution?.estimated_loss_mw || 0) - (left.attribution?.estimated_loss_mw || 0));
+  const attributedTotal = hydraulic.reduce((sum, site) => sum + (site.attribution?.estimated_loss_mw || 0), 0);
+  const observedGap = Math.max(0, theoretical - actual);
+  const unexplained = Math.max(0, observedGap - attributedTotal);
+  const lossStages = hydraulic.map((site, index) => {
+    const loss = site.attribution?.estimated_loss_mw || 0;
+    const priorLoss = hydraulic.slice(0, index + 1).reduce(
+      (sum, item) => sum + (item.attribution?.estimated_loss_mw || 0), 0,
+    );
+    return { site, loss, remaining: Math.max(0, theoretical - priorLoss) };
+  });
+  const expectedMechanical = Math.max(0, theoretical - attributedTotal);
+  const transformer = dashboard.sites.find((site) => site.asset_id === "main_transformer")!;
+  const cadence = Math.max(1, Math.round(pollSeconds / 60));
+
+  return (
+    <section className="waterfall-card">
+      <div className="section-bar">
+        <div><span className="section-index">02</span><strong>Energy waterfall</strong></div>
+        <span className={`explanation-state ${dashboard.attribution_status}`}>{dashboard.attribution_status === "unexplained" ? "UNEXPLAINED GAP" : dashboard.attribution_status === "attributed" ? "EVIDENCE LINKED" : "NO ACTIVE GAP"}</span>
+      </div>
+      <div className="waterfall-summary">
+        <div><span>READING</span><strong>{new Date(reading.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</strong></div>
+        <div><span>GAP</span><strong>{formatReading(reading.gap_pct, 2)}%</strong></div>
+        <div><span>REFRESH</span><strong>{cadence} MIN</strong></div>
+      </div>
+      <div className="waterfall-scroll">
+        <div className="waterfall-chart" role="group" aria-label="Theoretical-to-actual energy waterfall">
+          <div className="waterfall-column total">
+            <div className="waterfall-value">{theoretical.toFixed(2)}</div>
+            <div className="waterfall-bar theoretical" style={{ height: `${theoretical * scale}px` }} />
+            <strong>Theoretical</strong><small>Healthy MW</small>
+          </div>
+          {lossStages.map(({ site, loss, remaining: stageRemaining }) => (
+            <button
+              key={site.asset_id}
+              className={`waterfall-column loss ${selectedAssetId === site.asset_id ? "selected" : ""} ${loss > 0 ? "active-loss" : "zero-loss"}`}
+              onClick={() => onSelect(site.asset_id)}
+              aria-pressed={selectedAssetId === site.asset_id}
+            >
+              <div className="waterfall-value">−{loss.toFixed(2)}</div>
+              <div className="waterfall-bar hydraulic" style={{ height: `${Math.max(4, loss * scale)}px`, marginBottom: `${stageRemaining * scale}px` }} />
+              <strong>{site.name}</strong><small>{site.asset_type === "turbine" ? "Turbine loss" : "Hydraulic loss"}</small>
             </button>
           ))}
-          <div className="map-scale"><span>0</span><i /><span>50 M</span></div>
-        </div>
-        <div className="location-strip">
-          <div><span>SELECTED ASSET</span><strong>{selected?.name || "Loading plant…"}</strong></div>
-          <div><span>ZONE</span><strong>{selected?.zone || "—"}</strong></div>
-          <div><span>CONDITION</span><strong className={`condition ${selected?.status || "normal"}`}>{selected?.status || "Normal"}</strong></div>
-          <div><span>FINDINGS</span><strong>{selected?.finding_count ?? 0}</strong></div>
+          <div className="waterfall-column subtotal">
+            <div className="waterfall-value">{expectedMechanical.toFixed(2)}</div>
+            <div className="waterfall-bar mechanical" style={{ height: `${expectedMechanical * scale}px` }} />
+            <strong>Expected mechanical</strong><small>After linked losses</small>
+          </div>
+          <button className={`waterfall-column loss electrical ${selectedAssetId === transformer.asset_id ? "selected" : ""}`} onClick={() => onSelect(transformer.asset_id)} aria-pressed={selectedAssetId === transformer.asset_id}>
+            <div className="waterfall-value">0.00</div>
+            <div className="waterfall-bar transformer-scope" style={{ height: "4px", marginBottom: `${expectedMechanical * scale}px` }} />
+            <strong>Transformer</strong><small>{dashboard.actual_mw_meter_location === "generator_terminal" ? "Outside meter scope" : "Not attributed"}</small>
+          </button>
+          {unexplained > 0.005 && (
+            <div className="waterfall-column loss unexplained">
+              <div className="waterfall-value">−{unexplained.toFixed(2)}</div>
+              <div className="waterfall-bar unexplained-bar" style={{ height: `${Math.max(6, unexplained * scale)}px`, marginBottom: `${Math.max(0, actual) * scale}px` }} />
+              <strong>Unexplained</strong><small>No linked site evidence</small>
+            </div>
+          )}
+          <div className="waterfall-column total">
+            <div className="waterfall-value">{actual.toFixed(2)}</div>
+            <div className="waterfall-bar actual" style={{ height: `${Math.max(0, actual) * scale}px` }} />
+            <strong>Actual delivered</strong><small>Current MW</small>
+          </div>
         </div>
       </div>
-
-      <aside className="activity-card">
-        <div className="section-bar">
-          <div><span className="section-index">02</span><strong>Latest evidence</strong></div>
-          <button onClick={onShowFindings}>VIEW ALL ↗</button>
-        </div>
-        <div className="evidence-list">
-          {findings.slice(0, 4).map((finding) => <EvidenceCard key={finding.id} finding={finding} />)}
-          {!findings.length && <div className="empty-state"><b>No findings yet</b><span>Run an inspection to populate evidence.</span></div>}
-        </div>
-      </aside>
+      <p className="waterfall-note">Segments use stored Phase 4 estimates only. Confidence remains visible in the selected-site panel; transformer condition stays a standalone risk at the generator-terminal meter boundary.</p>
     </section>
   );
 }
 
-function EvidenceCard({ finding }: { finding: Finding }) {
-  const [x1, y1, x2, y2] = finding.bbox;
-  const box = { left: `${x1 / finding.width * 100}%`, top: `${y1 / finding.height * 100}%`, width: `${(x2 - x1) / finding.width * 100}%`, height: `${(y2 - y1) / finding.height * 100}%` };
+function SiteDetailPanel({ site, onClose }: { site: DashboardSite; onClose: () => void }) {
+  const event = site.latest_event;
+  const attribution = site.attribution;
   return (
-    <article className="evidence-card">
-      <div className="evidence-image">
-        <img src={mediaUrl(finding.thumbnail_url)} alt={`${finding.defect_type} evidence at ${finding.location_name}`} loading="lazy" />
-        <i className={`bbox ${finding.severity}`} style={box} />
-        <span className={`severity-tag ${finding.severity}`}>{finding.severity}</span>
-      </div>
-      <div className="evidence-copy">
-        <div><strong>{titleCase(finding.defect_type)}</strong><span>{Math.round(finding.confidence * 100)}% confidence</span></div>
-        <p>{finding.location_name} <i /> {relativeDate(finding.created_at)}</p>
-        <small className="evidence-area">{finding.affected_area_pct}% affected area</small>
-      </div>
-    </article>
+    <div className="site-detail-backdrop" onMouseDown={onClose}>
+      <aside className="site-detail-panel" role="dialog" aria-modal="true" aria-labelledby="site-detail-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="site-detail-head">
+          <div><p className="eyebrow">SYNCHRONIZED SITE DETAIL</p><h2 id="site-detail-title">{site.name}</h2><span>{site.zone}</span></div>
+          <button onClick={onClose} aria-label="Close site detail">×</button>
+        </div>
+        <div className="site-detail-evidence">
+          {event?.thumbnail_url ? <img src={mediaUrl(event.thumbnail_url)} alt={`Latest ${event.detection_type} evidence at ${site.name}`} /> : <div><b>No evidence thumbnail</b><span>Latest structured event remains available below.</span></div>}
+          <span className={`severity-tag ${siteCondition(site)}`}>{siteCondition(site)}</span>
+        </div>
+        <dl className="site-detail-facts">
+          <div><dt>Latest detection</dt><dd>{event ? titleCase(event.detection_type) : "No detection event"}</dd></div>
+          <div><dt>Measurement</dt><dd>{event ? measurementSummary(event.measurement) : "—"}</dd></div>
+          <div><dt>Estimated impact</dt><dd>{attribution ? `${attribution.estimated_loss_mw.toFixed(2)} MW` : "Not currently attributed"}</dd></div>
+          <div><dt>Attribution confidence</dt><dd>{attribution ? `${Math.round(attribution.confidence * 100)}% · rule based` : "—"}</dd></div>
+        </dl>
+        <section className="recommended-action">
+          <span>RECOMMENDED ACTION</span>
+          <p>{site.recommended_action || "Continue routine monitoring; no active defect recommendation."}</p>
+        </section>
+        <p className="detail-provenance">Evidence, measurements, loss estimate, and recommendation are stored records. Selecting this site triggers no model or LLM call.</p>
+      </aside>
+    </div>
   );
 }
 
