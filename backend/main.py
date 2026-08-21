@@ -35,6 +35,11 @@ from .reference_curves import (
 )
 from .site_detectors import DEFAULT_SENSOR, LOCATION_TO_ASSET, SiteDetectionService
 from .store import LOCATIONS, Store
+from .verification import (
+    AttributionVerificationScheduler,
+    AttributionVerificationService,
+    VerificationSettings,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -89,8 +94,11 @@ learned_attribution_settings = LearnedAttributionSettings.from_env()
 learned_attribution_service = LearnedAttributionService(store, learned_attribution_settings)
 learned_attribution_trainer = LearnedAttributionTrainer(store, learned_attribution_settings)
 learned_attribution_scheduler = LearnedAttributionRetrainingScheduler(
-    learned_attribution_trainer, learned_attribution_settings,
+    learned_attribution_trainer, learned_attribution_settings, learned_attribution_service,
 )
+verification_settings = VerificationSettings.from_env()
+verification_service = AttributionVerificationService(store, verification_settings)
+verification_scheduler = AttributionVerificationScheduler(verification_service)
 attribution_service = AttributionService(
     store,
     performance_calculation.curves,
@@ -129,9 +137,11 @@ LAN_ORIGIN_REGEX = (
 async def lifespan(_: FastAPI):
     performance_ingestion.start()
     learned_attribution_scheduler.start()
+    verification_scheduler.start()
     try:
         yield
     finally:
+        await verification_scheduler.stop()
         await learned_attribution_scheduler.stop()
         await performance_ingestion.stop()
 
@@ -344,8 +354,9 @@ def health() -> dict:
                     store.loss_model("active") or {}
                 ).get("model_id"),
                 "minimum_rows_per_defect": learned_attribution_settings.minimum_rows_per_defect,
-                "scheduled_retraining_is_shadow_only": True,
+                "automatic_promotion_gate": "wilson_precision_interval_and_brier_margin",
             },
+            "auto_verification": verification_service.monitoring(),
         },
         "phase3": {
             "assets": len({row["asset_id"] for row in store.site_assets()}),
@@ -397,6 +408,21 @@ def attribution_feedback(attribution_id: int, payload: AttributionFeedbackReques
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+@app.get("/api/attribution-verification/monitoring")
+def attribution_verification_monitoring() -> dict:
+    return verification_service.monitoring()
+
+
+@app.post("/api/attribution-verification/run")
+def run_attribution_verification() -> dict:
+    return verification_service.run_due()
+
+
+@app.get("/api/attribution-verification/backtest")
+def attribution_verification_backtest() -> dict:
+    return verification_service.backtest_manual_history()
+
+
 @app.get("/api/dashboard/current")
 def current_dashboard(response: Response) -> dict:
     response.headers["X-Poll-Interval-Seconds"] = str(
@@ -407,6 +433,7 @@ def current_dashboard(response: Response) -> dict:
         "poll_interval_seconds": performance_settings.effective_interval_seconds,
         "gap_threshold_pct": attribution_settings.threshold_pct,
         "actual_mw_meter_location": attribution_settings.meter_location,
+        "verification_monitoring": verification_service.monitoring(),
     }
 
 

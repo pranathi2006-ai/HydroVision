@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train, compare, and explicitly promote Phase 6 attribution models."""
+"""Train, evaluate, and roll back learned attribution models."""
 
 from __future__ import annotations
 
@@ -34,11 +34,12 @@ def parser() -> argparse.ArgumentParser:
     subcommands.add_parser("retrain-if-due", help="Run the same safe check used by the scheduler.")
     compare = subcommands.add_parser("compare", help="Compare a shadow version with its rule baseline.")
     compare.add_argument("model_id")
-    promote = subcommands.add_parser("promote", help="Human-approved promotion after a clear shadow win.")
+    promote = subcommands.add_parser(
+        "evaluate-promotion", help="Run the statistical gate and auto-promote only on a clear win."
+    )
     promote.add_argument("model_id")
-    promote.add_argument("--approved-by", required=True)
-    promote.add_argument("--confirm", required=True, help="Must be exactly: PROMOTE <model_id>")
-    promote.add_argument("--notes")
+    rollback = subcommands.add_parser("rollback", help="Instantly restore the predecessor or rule fallback.")
+    rollback.add_argument("model_id")
     return command
 
 
@@ -53,7 +54,8 @@ def main() -> int:
             "confirmed_outcomes": store.confirmed_attribution_count(),
             "shadow": store.loss_model("shadow"),
             "active": store.loss_model("active"),
-            "scheduler_can_promote": False,
+            "scheduler_can_promote": True,
+            "promotion_requires_human_approval": False,
         }
     elif args.command == "train":
         result = trainer.train()
@@ -61,13 +63,10 @@ def main() -> int:
         result = trainer.train_if_due()
     elif args.command == "compare":
         result = service.compare_shadow(args.model_id)
+    elif args.command == "evaluate-promotion":
+        result = service.auto_promote(args.model_id)
     else:
-        result = service.promote(
-            args.model_id,
-            approved_by=args.approved_by,
-            confirmation=args.confirm,
-            approval_notes=args.notes,
-        )
+        result = service.rollback(args.model_id)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     return 0
 

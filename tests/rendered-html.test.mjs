@@ -33,6 +33,8 @@ test("map and waterfall share one current-dashboard fetch and selection state", 
   assert.doesNotMatch(waterfall, /fetch\(/);
   assert.match(source, /selectedAssetId=\{selectedAssetId\}/);
   assert.match(source, /onSelect=\{setSelectedAssetId\}/);
+  assert.match(source, /Automated attribution verification monitoring/);
+  assert.match(source, /inconclusive_null_pct/);
 });
 
 test("detail panel identifies the stored attribution method without model calls", async () => {

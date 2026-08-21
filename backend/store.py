@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
@@ -320,6 +320,9 @@ class Store:
                     approved_at TEXT,
                     approval_notes TEXT,
                     supersedes_model_id TEXT,
+                    promotion_metrics TEXT,
+                    promoted_from_model_id TEXT,
+                    auto_promoted INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (supersedes_model_id) REFERENCES correlation_model_version(model_id)
                 );
                 CREATE TABLE IF NOT EXISTS loss_attribution (
@@ -361,14 +364,52 @@ class Store:
                 CREATE TABLE IF NOT EXISTS attribution_feedback (
                     feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     attribution_id INTEGER NOT NULL UNIQUE,
-                    confirmed INTEGER NOT NULL,
+                    confirmed INTEGER,
                     notes TEXT,
                     confirmed_by TEXT NOT NULL,
                     confirmed_at TEXT NOT NULL,
+                    verification_method TEXT CHECK (verification_method IN ('auto_matched_condition','manual')),
+                    sample_size_before INTEGER,
+                    sample_size_after INTEGER,
+                    gap_before_mean REAL,
+                    gap_after_mean REAL,
+                    p_value REAL,
                     FOREIGN KEY (attribution_id) REFERENCES loss_attribution(attribution_id)
                 );
                 CREATE INDEX IF NOT EXISTS attribution_feedback_confirmed_at_idx
                     ON attribution_feedback(confirmed_at DESC);
+                CREATE TABLE IF NOT EXISTS work_order (
+                    work_order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset_id TEXT NOT NULL,
+                    event_id INTEGER,
+                    attribution_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending_approval'
+                      CHECK (status IN ('pending_approval','approved','dispatched','closed','cancelled')),
+                    opened_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    dispatch_approved_by TEXT,
+                    dispatch_approved_at TEXT,
+                    FOREIGN KEY (asset_id) REFERENCES asset(asset_id),
+                    FOREIGN KEY (event_id) REFERENCES detection_event(event_id),
+                    FOREIGN KEY (attribution_id) REFERENCES loss_attribution(attribution_id),
+                    CHECK (event_id IS NOT NULL OR attribution_id IS NOT NULL)
+                );
+                CREATE TABLE IF NOT EXISTS attribution_verification_job (
+                    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    work_order_id INTEGER NOT NULL UNIQUE,
+                    attribution_id INTEGER NOT NULL,
+                    scheduled_for TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending','retrying','completed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    outcome_reason TEXT,
+                    completed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (work_order_id) REFERENCES work_order(work_order_id),
+                    FOREIGN KEY (attribution_id) REFERENCES loss_attribution(attribution_id)
+                );
+                CREATE INDEX IF NOT EXISTS attribution_verification_due_idx
+                    ON attribution_verification_job(status, scheduled_for);
                 """
             )
             media_columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
@@ -400,6 +441,9 @@ class Store:
                 "approved_at": "TEXT",
                 "approval_notes": "TEXT",
                 "supersedes_model_id": "TEXT",
+                "promotion_metrics": "TEXT",
+                "promoted_from_model_id": "TEXT",
+                "auto_promoted": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, definition in model_column_definitions.items():
                 if column not in model_columns:
@@ -426,22 +470,113 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS loss_attribution_shadow_model_idx "
                 "ON loss_attribution(shadow_model_id, attribution_id)"
             )
+            feedback_info = {
+                row["name"]: row for row in db.execute("PRAGMA table_info(attribution_feedback)")
+            }
+            if feedback_info.get("confirmed") and feedback_info["confirmed"]["notnull"]:
+                db.executescript(
+                    """
+                    DROP INDEX IF EXISTS attribution_feedback_confirmed_at_idx;
+                    ALTER TABLE attribution_feedback RENAME TO attribution_feedback_phase6;
+                    CREATE TABLE attribution_feedback (
+                        feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        attribution_id INTEGER NOT NULL UNIQUE,
+                        confirmed INTEGER,
+                        notes TEXT,
+                        confirmed_by TEXT NOT NULL,
+                        confirmed_at TEXT NOT NULL,
+                        verification_method TEXT CHECK (verification_method IN ('auto_matched_condition','manual')),
+                        sample_size_before INTEGER,
+                        sample_size_after INTEGER,
+                        gap_before_mean REAL,
+                        gap_after_mean REAL,
+                        p_value REAL,
+                        FOREIGN KEY (attribution_id) REFERENCES loss_attribution(attribution_id)
+                    );
+                    INSERT INTO attribution_feedback (
+                        feedback_id, attribution_id, confirmed, notes,
+                        confirmed_by, confirmed_at, verification_method
+                    )
+                    SELECT feedback_id, attribution_id, confirmed, notes,
+                           confirmed_by, confirmed_at, 'manual'
+                    FROM attribution_feedback_phase6;
+                    DROP TABLE attribution_feedback_phase6;
+                    CREATE INDEX attribution_feedback_confirmed_at_idx
+                        ON attribution_feedback(confirmed_at DESC);
+                    """
+                )
+                feedback_info = {
+                    row["name"]: row for row in db.execute("PRAGMA table_info(attribution_feedback)")
+                }
+            feedback_column_definitions = {
+                "verification_method": "TEXT",
+                "sample_size_before": "INTEGER",
+                "sample_size_after": "INTEGER",
+                "gap_before_mean": "REAL",
+                "gap_after_mean": "REAL",
+                "p_value": "REAL",
+            }
+            for column, definition in feedback_column_definitions.items():
+                if column not in feedback_info:
+                    db.execute(f"ALTER TABLE attribution_feedback ADD COLUMN {column} {definition}")
+            db.execute(
+                "UPDATE attribution_feedback SET verification_method = 'manual' "
+                "WHERE verification_method IS NULL"
+            )
             db.executescript(
                 """
-                CREATE TRIGGER IF NOT EXISTS correlation_model_activation_guard
-                BEFORE UPDATE OF status, approved_by, approved_at, comparison_metrics_json
+                DROP TRIGGER IF EXISTS correlation_model_activation_guard;
+                DROP TRIGGER IF EXISTS correlation_model_activation_insert_guard;
+                CREATE TRIGGER correlation_model_activation_guard
+                BEFORE UPDATE OF status, auto_promoted, promotion_metrics
                 ON correlation_model_version
                 WHEN NEW.purpose = 'loss_attribution' AND NEW.status = 'active'
-                  AND (NEW.comparison_metrics_json IS NULL OR NEW.approved_by IS NULL OR NEW.approved_at IS NULL)
+                  AND (NEW.auto_promoted != 1 OR NEW.promotion_metrics IS NULL)
                 BEGIN
-                  SELECT RAISE(ABORT, 'loss-attribution model activation requires comparison metrics and explicit approval');
+                  SELECT RAISE(ABORT, 'loss-attribution activation requires audited statistical auto-promotion');
                 END;
-                CREATE TRIGGER IF NOT EXISTS correlation_model_activation_insert_guard
+                CREATE TRIGGER correlation_model_activation_insert_guard
                 BEFORE INSERT ON correlation_model_version
                 WHEN NEW.purpose = 'loss_attribution' AND NEW.status = 'active'
-                  AND (NEW.comparison_metrics_json IS NULL OR NEW.approved_by IS NULL OR NEW.approved_at IS NULL)
+                  AND (NEW.auto_promoted != 1 OR NEW.promotion_metrics IS NULL)
                 BEGIN
-                  SELECT RAISE(ABORT, 'loss-attribution model activation requires comparison metrics and explicit approval');
+                  SELECT RAISE(ABORT, 'loss-attribution activation requires audited statistical auto-promotion');
+                END;
+                CREATE TRIGGER IF NOT EXISTS work_order_manual_dispatch_guard
+                BEFORE UPDATE OF status, dispatch_approved_by, dispatch_approved_at
+                ON work_order
+                WHEN NEW.status IN ('dispatched','closed')
+                  AND (NEW.dispatch_approved_by IS NULL OR NEW.dispatch_approved_at IS NULL)
+                BEGIN
+                  SELECT RAISE(ABORT, 'manual dispatch approval is required before dispatch or closure');
+                END;
+                CREATE TRIGGER IF NOT EXISTS work_order_manual_dispatch_insert_guard
+                BEFORE INSERT ON work_order
+                WHEN NEW.status IN ('dispatched','closed')
+                  AND (NEW.dispatch_approved_by IS NULL OR NEW.dispatch_approved_at IS NULL)
+                BEGIN
+                  SELECT RAISE(ABORT, 'manual dispatch approval is required before dispatch or closure');
+                END;
+                CREATE TRIGGER IF NOT EXISTS work_order_verification_schedule
+                AFTER UPDATE OF status ON work_order
+                WHEN NEW.status = 'closed' AND OLD.status != 'closed'
+                BEGIN
+                  INSERT OR IGNORE INTO attribution_verification_job (
+                    work_order_id, attribution_id, scheduled_for, created_at
+                  )
+                  SELECT NEW.work_order_id,
+                         COALESCE(
+                           NEW.attribution_id,
+                           (SELECT attribution_id FROM loss_attribution
+                            WHERE event_id = NEW.event_id ORDER BY attribution_id DESC LIMIT 1)
+                         ),
+                         datetime(NEW.closed_at, '+14 days'),
+                         datetime('now')
+                  WHERE COALESCE(
+                    NEW.attribution_id,
+                    (SELECT attribution_id FROM loss_attribution
+                     WHERE event_id = NEW.event_id ORDER BY attribution_id DESC LIMIT 1)
+                  ) IS NOT NULL;
                 END;
                 """
             )
@@ -929,8 +1064,9 @@ class Store:
                 cursor = db.execute(
                     """
                     INSERT INTO attribution_feedback (
-                        attribution_id, confirmed, notes, confirmed_by, confirmed_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        attribution_id, confirmed, notes, confirmed_by, confirmed_at,
+                        verification_method
+                    ) VALUES (?, ?, ?, ?, ?, 'manual')
                     """,
                     (attribution_id, int(confirmed), notes, reviewer, utc_now()),
                 )
@@ -941,12 +1077,280 @@ class Store:
                 (cursor.lastrowid,),
             ).fetchone()
         result = dict(row)
-        result["confirmed"] = bool(result["confirmed"])
+        result["confirmed"] = bool(result["confirmed"]) if result["confirmed"] is not None else None
         return result
 
     def confirmed_attribution_count(self) -> int:
         with self.connect() as db:
-            return int(db.execute("SELECT COUNT(*) FROM attribution_feedback").fetchone()[0])
+            return int(db.execute(
+                "SELECT COUNT(*) FROM attribution_feedback WHERE confirmed IS NOT NULL"
+            ).fetchone()[0])
+
+    def sync_closed_work_order_verifications(self, wait_days: int) -> int:
+        created = 0
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT w.work_order_id, w.closed_at,
+                       COALESCE(
+                         w.attribution_id,
+                         (SELECT attribution_id FROM loss_attribution
+                          WHERE event_id = w.event_id ORDER BY attribution_id DESC LIMIT 1)
+                       ) AS attribution_id
+                FROM work_order w
+                LEFT JOIN attribution_verification_job j ON j.work_order_id = w.work_order_id
+                WHERE w.status = 'closed' AND w.closed_at IS NOT NULL
+                  AND j.job_id IS NULL
+                """
+            ).fetchall()
+            for row in rows:
+                if row["attribution_id"] is None:
+                    continue
+                scheduled_for = (
+                    datetime.fromisoformat(row["closed_at"]).astimezone(timezone.utc)
+                    + timedelta(days=wait_days)
+                ).isoformat()
+                cursor = db.execute(
+                    """
+                    INSERT OR IGNORE INTO attribution_verification_job (
+                        work_order_id, attribution_id, scheduled_for, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (row["work_order_id"], row["attribution_id"], scheduled_for, utc_now()),
+                )
+                created += cursor.rowcount
+            # The database trigger uses the safe 14-day default. Reconcile
+            # untouched jobs with the configured interval so deployments can
+            # tune the wait without changing trigger DDL.
+            untouched = db.execute(
+                """
+                SELECT j.job_id, w.closed_at FROM attribution_verification_job j
+                JOIN work_order w ON w.work_order_id = j.work_order_id
+                WHERE j.status = 'pending' AND j.attempts = 0 AND w.closed_at IS NOT NULL
+                """
+            ).fetchall()
+            for row in untouched:
+                configured_time = (
+                    datetime.fromisoformat(row["closed_at"]).astimezone(timezone.utc)
+                    + timedelta(days=wait_days)
+                ).isoformat()
+                db.execute(
+                    "UPDATE attribution_verification_job SET scheduled_for = ? WHERE job_id = ?",
+                    (configured_time, row["job_id"]),
+                )
+        return created
+
+    def due_verification_jobs(self, now: datetime) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT j.*, w.asset_id, w.event_id, w.opened_at, w.closed_at
+                FROM attribution_verification_job j
+                JOIN work_order w ON w.work_order_id = j.work_order_id
+                WHERE j.status IN ('pending','retrying') AND j.scheduled_for <= ?
+                ORDER BY j.scheduled_for, j.job_id
+                """,
+                (now.astimezone(timezone.utc).isoformat(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def performance_readings_between(self, start: datetime, end: datetime) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT reading_id, ts, headwater_level, gate_position, gap_pct
+                FROM performance_reading
+                WHERE ts >= ? AND ts <= ?
+                  AND headwater_level IS NOT NULL
+                  AND gate_position IS NOT NULL
+                  AND gap_pct IS NOT NULL
+                ORDER BY ts, reading_id
+                """,
+                (
+                    start.astimezone(timezone.utc).isoformat(),
+                    end.astimezone(timezone.utc).isoformat(),
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def concurrent_closed_work_orders(
+        self,
+        *,
+        work_order_id: int,
+        asset_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT work_order_id, closed_at FROM work_order
+                WHERE work_order_id != ? AND asset_id = ? AND status = 'closed'
+                  AND closed_at >= ? AND closed_at <= ?
+                ORDER BY closed_at, work_order_id
+                """,
+                (
+                    work_order_id, asset_id,
+                    start.astimezone(timezone.utc).isoformat(),
+                    end.astimezone(timezone.utc).isoformat(),
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_auto_attribution_feedback(
+        self,
+        attribution_id: int,
+        *,
+        confirmed: bool | None,
+        notes: str,
+        sample_size_before: int,
+        sample_size_after: int,
+        gap_before_mean: float | None,
+        gap_after_mean: float | None,
+        p_value: float | None,
+    ) -> dict:
+        with self.connect() as db:
+            existing = db.execute(
+                "SELECT * FROM attribution_feedback WHERE attribution_id = ?",
+                (attribution_id,),
+            ).fetchone()
+            if existing is not None and existing["verification_method"] == "manual":
+                result = dict(existing)
+                result["manual_preserved"] = True
+                result["confirmed"] = (
+                    bool(result["confirmed"]) if result["confirmed"] is not None else None
+                )
+                return result
+            values = (
+                int(confirmed) if confirmed is not None else None,
+                notes,
+                "system_auto",
+                utc_now(),
+                sample_size_before,
+                sample_size_after,
+                gap_before_mean,
+                gap_after_mean,
+                p_value,
+                attribution_id,
+            )
+            if existing is None:
+                cursor = db.execute(
+                    """
+                    INSERT INTO attribution_feedback (
+                        confirmed, notes, confirmed_by, confirmed_at,
+                        verification_method, sample_size_before, sample_size_after,
+                        gap_before_mean, gap_after_mean, p_value, attribution_id
+                    ) VALUES (?, ?, ?, ?, 'auto_matched_condition', ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+                feedback_id = cursor.lastrowid
+            else:
+                db.execute(
+                    """
+                    UPDATE attribution_feedback SET
+                        confirmed = ?, notes = ?, confirmed_by = ?, confirmed_at = ?,
+                        verification_method = 'auto_matched_condition',
+                        sample_size_before = ?, sample_size_after = ?,
+                        gap_before_mean = ?, gap_after_mean = ?, p_value = ?
+                    WHERE attribution_id = ?
+                    """,
+                    values,
+                )
+                feedback_id = existing["feedback_id"]
+            row = db.execute(
+                "SELECT * FROM attribution_feedback WHERE feedback_id = ?", (feedback_id,),
+            ).fetchone()
+        result = dict(row)
+        result["confirmed"] = bool(result["confirmed"]) if result["confirmed"] is not None else None
+        return result
+
+    def finish_verification_job(
+        self,
+        job_id: int,
+        *,
+        reason: str,
+        retry_at: datetime | None = None,
+    ) -> None:
+        with self.connect() as db:
+            if retry_at is None:
+                db.execute(
+                    """
+                    UPDATE attribution_verification_job
+                    SET status = 'completed', attempts = attempts + 1,
+                        outcome_reason = ?, completed_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (reason, utc_now(), job_id),
+                )
+            else:
+                db.execute(
+                    """
+                    UPDATE attribution_verification_job
+                    SET status = 'retrying', attempts = attempts + 1,
+                        outcome_reason = ?, scheduled_for = ?, completed_at = NULL
+                    WHERE job_id = ?
+                    """,
+                    (reason, retry_at.astimezone(timezone.utc).isoformat(), job_id),
+                )
+
+    def verification_monitoring(self, null_alert_threshold: float) -> dict:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN f.verification_method = 'auto_matched_condition'
+                                     AND f.confirmed = 1 THEN 1 ELSE 0 END) AS confirmed,
+                       SUM(CASE WHEN f.verification_method = 'auto_matched_condition'
+                                     AND f.confirmed = 0 THEN 1 ELSE 0 END) AS rejected,
+                       SUM(CASE WHEN f.verification_method = 'auto_matched_condition'
+                                     AND f.confirmed IS NULL THEN 1 ELSE 0 END) AS inconclusive,
+                       SUM(CASE WHEN j.status IN ('pending','retrying') THEN 1 ELSE 0 END) AS pending
+                FROM attribution_verification_job j
+                LEFT JOIN attribution_feedback f ON f.attribution_id = j.attribution_id
+                """
+            ).fetchone()
+        total = int(row["total"] or 0)
+        confirmed = int(row["confirmed"] or 0)
+        rejected = int(row["rejected"] or 0)
+        inconclusive = int(row["inconclusive"] or 0)
+        pending = int(row["pending"] or 0)
+        denominator = max(total, 1)
+        null_rate = inconclusive / denominator
+        alert = (
+            f"Auto-verification NULL rate is {null_rate:.1%}; review tolerance and wait-window settings."
+            if total >= 5 and null_rate > null_alert_threshold else None
+        )
+        return {
+            "closed_linked_work_orders": total,
+            "auto_confirmed": confirmed,
+            "auto_rejected": rejected,
+            "inconclusive_null": inconclusive,
+            "pending": pending,
+            "auto_confirmed_pct": round(100 * confirmed / denominator, 2),
+            "auto_rejected_pct": round(100 * rejected / denominator, 2),
+            "inconclusive_null_pct": round(100 * null_rate, 2),
+            "alert": alert,
+        }
+
+    def manual_feedback_work_orders(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT f.feedback_id, f.confirmed, f.attribution_id,
+                       w.work_order_id, w.asset_id, w.opened_at, w.closed_at
+                FROM attribution_feedback f
+                JOIN loss_attribution l ON l.attribution_id = f.attribution_id
+                JOIN work_order w ON (
+                    w.attribution_id = f.attribution_id OR
+                    (w.attribution_id IS NULL AND w.event_id = l.event_id)
+                )
+                WHERE f.verification_method = 'manual' AND f.confirmed IS NOT NULL
+                  AND w.status = 'closed' AND w.closed_at IS NOT NULL
+                ORDER BY f.feedback_id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def labeled_attribution_rows(self) -> list[dict]:
         with self.connect() as db:
@@ -964,6 +1368,7 @@ class Store:
                 JOIN detection_event e ON e.event_id = l.event_id
                 JOIN asset a ON a.asset_id = l.asset_id
                 JOIN performance_reading p ON p.reading_id = l.reading_id
+                WHERE f.confirmed IS NOT NULL
                 ORDER BY f.confirmed_at, f.feedback_id
                 """
             ).fetchall()
@@ -1061,9 +1466,12 @@ class Store:
         model = dict(row)
         for column in (
             "metrics_json", "comparison_metrics_json", "artifact_json", "defect_counts_json",
+            "promotion_metrics",
         ):
             value = model.pop(column)
-            model[column.removesuffix("_json")] = json.loads(value) if value else None
+            target = column.removesuffix("_json")
+            model[target] = json.loads(value) if value else None
+        model["auto_promoted"] = bool(model.get("auto_promoted"))
         return model
 
     def shadow_feedback_rows(self, model_id: str) -> list[dict]:
@@ -1075,6 +1483,7 @@ class Store:
                 FROM attribution_feedback f
                 JOIN loss_attribution l ON l.attribution_id = f.attribution_id
                 WHERE l.shadow_model_id = ? AND l.shadow_probability IS NOT NULL
+                  AND f.confirmed IS NOT NULL
                 ORDER BY f.confirmed_at, f.feedback_id
                 """,
                 (model_id,),
@@ -1098,25 +1507,25 @@ class Store:
                 (json.dumps(metrics, sort_keys=True), model_id),
             )
 
-    def activate_loss_model(
-        self,
-        model_id: str,
-        *,
-        approved_by: str,
-        approval_notes: str | None,
-    ) -> None:
+    def auto_activate_loss_model(self, model_id: str, promotion_metrics: dict) -> dict:
         with self.connect() as db:
             model = db.execute(
                 """
-                SELECT comparison_metrics_json FROM correlation_model_version
+                SELECT status FROM correlation_model_version
                 WHERE model_id = ? AND purpose = 'loss_attribution' AND status = 'shadow'
                 """,
                 (model_id,),
             ).fetchone()
             if model is None:
                 raise ValueError("model is not an eligible shadow version")
-            if not model["comparison_metrics_json"]:
-                raise ValueError("shadow comparison has not been recorded")
+            previous = db.execute(
+                """
+                SELECT model_id FROM correlation_model_version
+                WHERE purpose = 'loss_attribution' AND status = 'active'
+                ORDER BY trained_at DESC LIMIT 1
+                """
+            ).fetchone()
+            previous_id = previous["model_id"] if previous else None
             db.execute(
                 """
                 UPDATE correlation_model_version SET status = 'retired'
@@ -1126,11 +1535,50 @@ class Store:
             db.execute(
                 """
                 UPDATE correlation_model_version
-                SET status = 'active', approved_by = ?, approved_at = ?, approval_notes = ?
+                SET status = 'active', promotion_metrics = ?,
+                    promoted_from_model_id = ?, auto_promoted = 1,
+                    approved_by = NULL, approved_at = NULL, approval_notes = NULL
                 WHERE model_id = ?
                 """,
-                (approved_by, utc_now(), approval_notes, model_id),
+                (json.dumps(promotion_metrics, sort_keys=True), previous_id, model_id),
             )
+        return {"model_id": model_id, "promoted_from_model_id": previous_id}
+
+    def rollback_auto_promoted_model(self, model_id: str) -> dict:
+        with self.connect() as db:
+            current = db.execute(
+                """
+                SELECT promoted_from_model_id FROM correlation_model_version
+                WHERE model_id = ? AND purpose = 'loss_attribution'
+                  AND status = 'active' AND auto_promoted = 1
+                """,
+                (model_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError("model is not the active auto-promoted version")
+            previous_id = current["promoted_from_model_id"]
+            db.execute(
+                "UPDATE correlation_model_version SET status = 'retired' WHERE model_id = ?",
+                (model_id,),
+            )
+            if previous_id:
+                db.execute(
+                    """
+                    UPDATE correlation_model_version SET status = 'active'
+                    WHERE model_id = ? AND purpose = 'loss_attribution'
+                    """,
+                    (previous_id,),
+                )
+                if db.execute(
+                    "SELECT 1 FROM correlation_model_version WHERE model_id = ? AND status = 'active'",
+                    (previous_id,),
+                ).fetchone() is None:
+                    raise ValueError("rollback predecessor is unavailable")
+        return {
+            "rolled_back_model_id": model_id,
+            "active_model_id": previous_id,
+            "fallback": "previous_model" if previous_id else "rule_based",
+        }
 
     def current_dashboard(self) -> dict:
         """Return one transactionally consistent read model for both Phase 5 views."""

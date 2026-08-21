@@ -26,6 +26,7 @@ def settings() -> LearnedAttributionSettings:
         minimum_shadow_feedback=10,
         minimum_shadow_days=0,
         promotion_brier_margin=0.02,
+        promotion_precision_margin=0.02,
         retrain_days=30,
         retrain_new_feedback=10,
         scheduler_check_seconds=60,
@@ -154,11 +155,11 @@ def test_shadow_scores_separately_and_rare_defect_stays_rule_based(tmp_path: Pat
     assert "shadow_model_id" not in rare
 
 
-def test_promotion_requires_real_comparison_clear_win_and_explicit_human_confirmation(tmp_path: Path) -> None:
+def test_statistical_auto_promotion_logs_intervals_and_rolls_back_in_one_action(tmp_path: Path) -> None:
     store = Store(tmp_path / "hydrovision.sqlite3")
     model = train_shadow(store)
     service = LearnedAttributionService(store, settings())
-    for index in range(200, 212):
+    for index in range(200, 300):
         confirmed = index % 2 == 0
         insert_example(
             store,
@@ -171,25 +172,21 @@ def test_promotion_requires_real_comparison_clear_win_and_explicit_human_confirm
     comparison = service.compare_shadow(model["model_id"])
     assert comparison["clearly_better"] is True
     assert comparison["shadow"]["precision"] > comparison["rule_baseline"]["precision"]
+    assert comparison["shadow_precision_interval"]["wilson_lower_95"] > (
+        comparison["rule_precision_interval"]["wilson_upper_95"]
+    )
 
-    with pytest.raises(PermissionError, match="explicit confirmation"):
-        service.promote(
-            model["model_id"], approved_by="chief.engineer", confirmation="yes",
-        )
-    with store.connect() as db, pytest.raises(sqlite3.IntegrityError, match="explicit approval"):
+    with store.connect() as db, pytest.raises(sqlite3.IntegrityError, match="statistical auto-promotion"):
         db.execute(
             "UPDATE correlation_model_version SET status = 'active' WHERE model_id = ?",
             (model["model_id"],),
         )
 
-    promoted = service.promote(
-        model["model_id"],
-        approved_by="chief.engineer",
-        confirmation=f"PROMOTE {model['model_id']}",
-        approval_notes="Shadow review approved in the monthly reliability meeting.",
-    )
-    assert promoted["status"] == "active"
-    assert promoted["approved_by"] == "chief.engineer"
+    promoted = service.auto_promote(model["model_id"])
+    assert promoted["status"] == "auto_promoted"
+    active_model = store.loss_model("active")
+    assert active_model["auto_promoted"] is True
+    assert active_model["promotion_metrics"]["confidence_interval_win"] is True
     active_reading, active_event, _ = insert_example(store, 300, confirmed=True)
     active_score = service.score_contributions(active_reading, [{
         "asset_id": "penstock_valve",
@@ -201,8 +198,27 @@ def test_promotion_requires_real_comparison_clear_win_and_explicit_human_confirm
     assert active_score["model_id"] == model["model_id"]
     assert 0 < active_score["estimated_loss_mw"] <= active_score["rule_estimate_mw"]
 
+    replacement = LearnedAttributionTrainer(store, settings()).train()
+    for index in range(400, 500):
+        confirmed = index % 2 == 0
+        insert_example(
+            store,
+            index,
+            confirmed=confirmed,
+            shadow_model_id=replacement["model_id"],
+            shadow_probability=0.95 if confirmed else 0.05,
+        )
+    replacement_promotion = service.auto_promote(replacement["model_id"])
+    assert replacement_promotion["promoted_from_model_id"] == model["model_id"]
 
-def test_scheduler_entry_point_never_promotes(tmp_path: Path) -> None:
+    rollback = service.rollback(replacement["model_id"])
+
+    assert rollback["active_model_id"] == model["model_id"]
+    assert store.loss_model("active")["model_id"] == model["model_id"]
+    assert store.loss_model_by_id(replacement["model_id"])["status"] == "retired"
+
+
+def test_scheduler_entry_point_cannot_promote_without_evaluation_gate(tmp_path: Path) -> None:
     store = Store(tmp_path / "hydrovision.sqlite3")
     for index in range(40):
         insert_example(store, index, confirmed=index % 2 == 0)

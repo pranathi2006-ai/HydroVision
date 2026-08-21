@@ -95,6 +95,18 @@ type DashboardSite = {
   recommended_action: string | null;
 };
 
+type VerificationMonitoring = {
+  closed_linked_work_orders: number;
+  auto_confirmed: number;
+  auto_rejected: number;
+  inconclusive_null: number;
+  pending: number;
+  auto_confirmed_pct: number;
+  auto_rejected_pct: number;
+  inconclusive_null_pct: number;
+  alert: string | null;
+};
+
 type CurrentDashboard = {
   reading: PerformanceReading | null;
   attribution_status: "attributed" | "unexplained" | "not_triggered";
@@ -102,6 +114,7 @@ type CurrentDashboard = {
   poll_interval_seconds: number;
   gap_threshold_pct: number;
   actual_mw_meter_location: "generator_terminal" | "grid_connection" | "unconfirmed";
+  verification_monitoring: VerificationMonitoring;
 };
 
 type View = "twin" | "findings" | "performance";
@@ -110,6 +123,17 @@ const EMPTY: Snapshot = {
   locations: [],
   findings: [],
   metrics: { monitored_locations: 0, active_findings: 0, critical_findings: 0 },
+};
+const EMPTY_VERIFICATION: VerificationMonitoring = {
+  closed_linked_work_orders: 0,
+  auto_confirmed: 0,
+  auto_rejected: 0,
+  inconclusive_null: 0,
+  pending: 0,
+  auto_confirmed_pct: 0,
+  auto_rejected_pct: 0,
+  inconclusive_null_pct: 0,
+  alert: null,
 };
 
 // When opened from another computer, use the HydroVision host's LAN address
@@ -467,8 +491,17 @@ function UnifiedOperationsView({ dashboard, selectedAssetId, onSelect, pollSecon
     return <div className="unified-empty"><b>Waiting for the current plant snapshot</b><span>The map and waterfall will load together.</span></div>;
   }
   const selectedSite = dashboard.sites.find((site) => site.asset_id === selectedAssetId) || null;
+  const verification = dashboard.verification_monitoring || EMPTY_VERIFICATION;
   return (
     <>
+      <section className={`verification-monitor ${verification.alert ? "alert" : ""}`} aria-label="Automated attribution verification monitoring">
+        <div><span>AUTO-VERIFICATION</span><strong>{verification.closed_linked_work_orders ? `${verification.auto_confirmed_pct.toFixed(0)}% confirmed` : "Awaiting closed work orders"}</strong></div>
+        <div><span>CONFIRMED</span><strong>{verification.auto_confirmed}</strong></div>
+        <div><span>REJECTED</span><strong>{verification.auto_rejected}</strong></div>
+        <div><span>INCONCLUSIVE</span><strong>{verification.inconclusive_null} · {verification.inconclusive_null_pct.toFixed(0)}%</strong></div>
+        <div><span>PENDING</span><strong>{verification.pending}</strong></div>
+        {verification.alert && <p>{verification.alert}</p>}
+      </section>
       <section className="unified-layout">
         <SpatialTwin sites={dashboard.sites} selectedAssetId={selectedAssetId} onSelect={onSelect} />
         <EnergyWaterfall dashboard={dashboard} selectedAssetId={selectedAssetId} onSelect={onSelect} pollSeconds={pollSeconds} />

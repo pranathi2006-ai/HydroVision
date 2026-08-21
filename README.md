@@ -224,37 +224,59 @@ and the reading's gap magnitude. Coefficients and per-prediction feature
 contributions are stored as JSON in the shared `correlation_model_version`
 registry and `loss_attribution` row.
 
-Record one final engineer outcome per attribution:
+Historical engineer outcomes remain readable as `verification_method=manual`,
+but new labels are generated automatically after a manually approved work order
+is closed. The verifier waits 14 days by default, then performs one-to-one
+matching of pre/post readings whose gate position and headwater are within 5%.
+It requires at least 20 matched readings on each side and runs a paired t-test
+with a minimum effect-size gate. Significant gap improvement confirms the
+attribution; significant worsening rejects it; insufficient or non-significant
+evidence stays NULL. Concurrent closures for the same asset are always NULL.
+
+Inspect, run, or backtest verification with:
 
 ```bash
-curl -X POST http://localhost:8001/api/loss-attribution/123/feedback \
-  -H 'Content-Type: application/json' \
-  -d '{"confirmed":true,"notes":"Output recovered after rack cleaning","confirmed_by":"engineer.name"}'
+python3 scripts/manage_attribution_verification.py monitor
+python3 scripts/manage_attribution_verification.py run-due
+python3 scripts/manage_attribution_verification.py backtest
 ```
 
-Use the management command for manual training and review:
+Each auto-generated feedback row records `system_auto`, sample sizes, mean gaps,
+p-value, and the matched-condition method. Insufficient samples are retried
+until the comparison window closes. The dashboard and health endpoint expose
+confirmed/rejected/NULL/pending rates and warn when the NULL rate exceeds the
+configured threshold.
+
+Use the model management command for training, statistical promotion review,
+and immediate rollback:
 
 ```bash
 python3 scripts/manage_loss_attribution_model.py status
 python3 scripts/manage_loss_attribution_model.py train
 python3 scripts/manage_loss_attribution_model.py compare lossattr-YYYYMMDDHHMMSS-id
-python3 scripts/manage_loss_attribution_model.py promote lossattr-YYYYMMDDHHMMSS-id \
-  --approved-by engineer.name \
-  --confirm 'PROMOTE lossattr-YYYYMMDDHHMMSS-id'
+python3 scripts/manage_loss_attribution_model.py evaluate-promotion lossattr-YYYYMMDDHHMMSS-id
+python3 scripts/manage_loss_attribution_model.py rollback lossattr-YYYYMMDDHHMMSS-id
 ```
 
 Every new or retrained version starts in `shadow`. During shadow operation the
 rule estimate remains the displayed value, while the model probability and MW
 estimate are stored separately. The daily scheduler checks for either the
-configured monthly interval or enough new feedback and can only train another
-shadow version; it has no promotion code path. Promotion requires a real shadow
-comparison after at least 14 days and the configured number of confirmed shadow
-outcomes, a clear Brier-score improvement, a named approver, and the exact
-confirmation phrase. A database trigger rejects activation without comparison
-and approval fields.
+configured monthly interval or enough new feedback. A shadow version is
+auto-promoted only when its Brier score improves by the configured margin and
+its 95% Wilson precision lower bound exceeds the rule baseline's upper bound by
+the configured margin, after the minimum shadow duration and event count.
+The complete interval/metric snapshot, predecessor model, and auto-promotion
+flag are retained. Rollback restores that predecessor—or the Phase 4 rule
+fallback for the first model—in one transaction without deleting any version or
+attribution row.
 
 After promotion, defect types below
 `HYDROVISION_LEARNED_MIN_DEFECT_ROWS` continue using `method=rule_based`.
 The detail panel displays the method used for the current estimate. With no
 confirmed outcomes in the local database, the integrated application remains
 on the Phase 4 rule engine and no synthetic feedback is inserted.
+
+The compatibility `work_order` schema enforces named, timestamped manual
+dispatch approval before either `dispatched` or `closed` status. Automated
+verification begins only after closure and never creates, approves, or
+dispatches physical work.

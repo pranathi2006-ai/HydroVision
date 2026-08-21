@@ -41,6 +41,7 @@ class LearnedAttributionSettings:
     minimum_shadow_feedback: int = 30
     minimum_shadow_days: int = 14
     promotion_brier_margin: float = 0.02
+    promotion_precision_margin: float = 0.02
     retrain_days: int = 30
     retrain_new_feedback: int = 25
     scheduler_check_seconds: int = 24 * 60 * 60
@@ -54,6 +55,7 @@ class LearnedAttributionSettings:
             minimum_shadow_feedback=int(os.getenv("HYDROVISION_LEARNED_MIN_SHADOW_FEEDBACK", "30")),
             minimum_shadow_days=int(os.getenv("HYDROVISION_LEARNED_MIN_SHADOW_DAYS", "14")),
             promotion_brier_margin=float(os.getenv("HYDROVISION_LEARNED_PROMOTION_BRIER_MARGIN", "0.02")),
+            promotion_precision_margin=float(os.getenv("HYDROVISION_LEARNED_PROMOTION_PRECISION_MARGIN", "0.02")),
             retrain_days=int(os.getenv("HYDROVISION_LEARNED_RETRAIN_DAYS", "30")),
             retrain_new_feedback=int(os.getenv("HYDROVISION_LEARNED_RETRAIN_NEW_FEEDBACK", "25")),
             scheduler_check_seconds=int(os.getenv("HYDROVISION_LEARNED_SCHEDULER_CHECK_SECONDS", "86400")),
@@ -66,6 +68,7 @@ class LearnedAttributionSettings:
             settings.minimum_shadow_feedback < 1
             or settings.minimum_shadow_days < 0
             or settings.promotion_brier_margin < 0
+            or settings.promotion_precision_margin < 0
         ):
             raise ValueError("learned-attribution promotion settings are invalid")
         if settings.retrain_days < 1 or settings.retrain_new_feedback < 1:
@@ -127,6 +130,35 @@ def _classification_metrics(labels: np.ndarray, probabilities: np.ndarray) -> di
         "recall": round(float(recall), 6),
         "f1": round(float(f1), 6),
         "brier_score": round(float(brier_score_loss(labels, probabilities)), 6),
+    }
+
+
+def _wilson_precision(labels: np.ndarray, probabilities: np.ndarray) -> dict[str, float | int]:
+    predicted = probabilities >= 0.5
+    predicted_positive = int(np.sum(predicted))
+    true_positive = int(np.sum((labels == 1) & predicted))
+    if predicted_positive == 0:
+        return {
+            "true_positive": 0,
+            "predicted_positive": 0,
+            "precision": 0.0,
+            "wilson_lower_95": 0.0,
+            "wilson_upper_95": 1.0,
+        }
+    proportion = true_positive / predicted_positive
+    z = 1.959963984540054
+    denominator = 1 + z ** 2 / predicted_positive
+    center = (proportion + z ** 2 / (2 * predicted_positive)) / denominator
+    spread = z * math.sqrt(
+        proportion * (1 - proportion) / predicted_positive
+        + z ** 2 / (4 * predicted_positive ** 2)
+    ) / denominator
+    return {
+        "true_positive": true_positive,
+        "predicted_positive": predicted_positive,
+        "precision": round(proportion, 6),
+        "wilson_lower_95": round(max(0.0, center - spread), 6),
+        "wilson_upper_95": round(min(1.0, center + spread), 6),
     }
 
 
@@ -205,7 +237,7 @@ class LearnedAttributionTrainer:
         train_scaled = scaler.fit_transform(train_matrix)
         validation_scaled = scaler.transform(validation_matrix)
         classifier = LogisticRegression(
-            class_weight="balanced", max_iter=500, random_state=42,
+            class_weight="balanced", max_iter=500, random_state=42, solver="liblinear",
         )
         classifier.fit(train_scaled, train_labels)
         learned_probabilities = classifier.predict_proba(validation_scaled)[:, 1]
@@ -350,10 +382,20 @@ class LearnedAttributionService:
         rule_probabilities = np.asarray([row["rule_probability"] for row in rows], dtype=float)
         shadow_metrics = _classification_metrics(labels, shadow_probabilities)
         rule_metrics = _classification_metrics(labels, rule_probabilities)
-        clearly_better = (
+        shadow_precision = _wilson_precision(labels, shadow_probabilities)
+        rule_precision = _wilson_precision(labels, rule_probabilities)
+        brier_better = (
             shadow_metrics["brier_score"] + self.settings.promotion_brier_margin
             < rule_metrics["brier_score"]
-            and shadow_metrics["precision"] >= rule_metrics["precision"]
+        )
+        confidence_interval_win = (
+            shadow_precision["predicted_positive"] > 0
+            and shadow_precision["wilson_lower_95"]
+            > rule_precision["wilson_upper_95"] + self.settings.promotion_precision_margin
+        )
+        clearly_better = (
+            brier_better
+            and confidence_interval_win
             and shadow_metrics["recall"] >= 0.5
         )
         comparison = {
@@ -362,48 +404,61 @@ class LearnedAttributionService:
             "minimum_shadow_days": self.settings.minimum_shadow_days,
             "shadow": shadow_metrics,
             "rule_baseline": rule_metrics,
+            "shadow_precision_interval": shadow_precision,
+            "rule_precision_interval": rule_precision,
             "required_brier_margin": self.settings.promotion_brier_margin,
+            "required_precision_interval_margin": self.settings.promotion_precision_margin,
+            "brier_better": brier_better,
+            "confidence_interval_win": confidence_interval_win,
             "clearly_better": clearly_better,
             "evaluated_at": utc_now(),
         }
         self.store.save_model_comparison(model_id, comparison)
         return comparison
 
-    def promote(
-        self,
-        model_id: str,
-        *,
-        approved_by: str,
-        confirmation: str,
-        approval_notes: str | None = None,
-    ) -> dict:
-        reviewer = approved_by.strip()
-        if not reviewer:
-            raise ValueError("approved_by is required")
-        if confirmation != f"PROMOTE {model_id}":
-            raise PermissionError(f"explicit confirmation must equal 'PROMOTE {model_id}'")
-        model = self.store.loss_model_by_id(model_id)
-        if model is None or model["status"] != "shadow":
-            raise ValueError("only a shadow loss-attribution model can be promoted")
-        comparison = model.get("comparison_metrics")
-        if not comparison or not comparison.get("clearly_better"):
-            raise ValueError("shadow model has not demonstrated a clear win over the rule baseline")
-        self.store.activate_loss_model(
-            model_id, approved_by=reviewer, approval_notes=approval_notes,
-        )
+    def auto_promote(self, model_id: str) -> dict:
+        comparison = self.compare_shadow(model_id)
+        if not comparison["clearly_better"]:
+            return {"status": "shadow_retained", "model_id": model_id, "comparison": comparison}
+        promotion_metrics = {
+            **comparison,
+            "promotion_gate": "wilson_precision_interval_and_brier_margin",
+            "auto_promoted_at": utc_now(),
+        }
+        activated = self.store.auto_activate_loss_model(model_id, promotion_metrics)
         logger.warning(
-            "loss-attribution model promoted model_id=%s approved_by=%s",
-            model_id, reviewer,
+            "loss-attribution model auto-promoted model_id=%s metrics=%s",
+            model_id, promotion_metrics,
         )
-        return self.store.loss_model_by_id(model_id) or {"model_id": model_id, "status": "active"}
+        return {"status": "auto_promoted", **activated, "promotion_metrics": promotion_metrics}
+
+    def auto_promote_current(self) -> dict:
+        shadow = self.store.loss_model("shadow")
+        if shadow is None:
+            return {"status": "no_shadow_model"}
+        try:
+            return self.auto_promote(shadow["model_id"])
+        except ValueError as error:
+            return {"status": "not_ready", "model_id": shadow["model_id"], "reason": str(error)}
+
+    def rollback(self, model_id: str) -> dict:
+        result = self.store.rollback_auto_promoted_model(model_id)
+        logger.error("loss-attribution auto-promotion rolled back result=%s", result)
+        return result
 
 
 class LearnedAttributionRetrainingScheduler:
-    """Periodic shadow-only retraining. This class has no promotion path."""
+    """Periodic shadow retraining plus the audited statistical promotion gate."""
 
-    def __init__(self, trainer: LearnedAttributionTrainer, settings: LearnedAttributionSettings) -> None:
+    def __init__(
+        self,
+        trainer: LearnedAttributionTrainer,
+        settings: LearnedAttributionSettings,
+        learned_service: LearnedAttributionService | None = None,
+    ) -> None:
         self.trainer = trainer
         self.settings = settings
+        self.learned_service = learned_service
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -426,6 +481,10 @@ class LearnedAttributionRetrainingScheduler:
                 result = await asyncio.to_thread(self.trainer.train_if_due)
                 if result["status"] == "trained_shadow":
                     logger.info("scheduled loss-attribution retraining created %s", result["model_id"])
+                if self.learned_service is not None:
+                    promotion = await asyncio.to_thread(self.learned_service.auto_promote_current)
+                    if promotion["status"] == "auto_promoted":
+                        logger.warning("scheduled statistical promotion result=%s", promotion)
             except Exception:
                 logger.exception("scheduled loss-attribution retraining failed; rule fallback remains active")
             await asyncio.sleep(self.settings.scheduler_check_seconds)
