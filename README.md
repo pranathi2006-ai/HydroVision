@@ -46,9 +46,15 @@ connections if the operating-system firewall asks.
 To run the two processes separately:
 
 ```bash
-npm run dev
+npm run dev:web
 npm run backend
 ```
+
+`npm run dev` is the recommended command and starts both processes, waiting for
+the API health check before opening the dashboard server. This prevents the
+initial findings request from racing the backend startup. The dashboard also
+refreshes its findings snapshot on the same five-minute cadence as operational
+readings, so it reconnects after a temporary API interruption.
 
 ## Model weights
 

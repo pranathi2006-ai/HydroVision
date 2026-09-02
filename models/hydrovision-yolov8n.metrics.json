@@ -1,9 +1,21 @@
 {
-  "weights": "/Users/dspl_017/HydroVision/models/hydrovision-yolov8n.pt",
-  "classes": {
-    "0": "oil_leak",
-    "1": "corrosion"
-  },
-  "map50": 0.8741044465751514,
-  "map50_95": 0.6640658675652393
+  "validated_checkpoint": "/Users/dspl_017/HydroVision/runs/hydrovision/hydrovision-rgb-large/weights/best.pt",
+  "validation_device": "cpu",
+  "validation_split": "test",
+  "map50": 0.6811273380036488,
+  "map50_95": 0.4975906276050111,
+  "per_class": {
+    "oil_leak": {
+      "precision": 0.9067635425949543,
+      "recall": 0.9850374064837906,
+      "map50": 0.992218903749523,
+      "map50_95": 0.8045296866700452
+    },
+    "corrosion": {
+      "precision": 0.5254834580553608,
+      "recall": 0.3391655450874832,
+      "map50": 0.3700357722577745,
+      "map50_95": 0.19065156853997678
+    }
+  }
 }

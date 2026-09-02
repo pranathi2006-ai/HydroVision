@@ -214,20 +214,28 @@ export function HydroVisionApp() {
 
   useEffect(() => {
     let cancelled = false;
-    void fetch(`${API}/api/snapshot`)
-      .then((response) => {
+    async function loadSnapshot() {
+      try {
+        const response = await fetch(`${API}/api/snapshot`);
         if (!response.ok) throw new Error("Service unavailable");
-        return response.json();
-      })
-      .then((data) => {
+        const data: Snapshot = await response.json();
         if (cancelled) return;
         setSnapshot(data);
         setConnected(true);
-      })
-      .catch(() => {
+      } catch {
         if (!cancelled) setConnected(false);
-      });
-    return () => { cancelled = true; };
+      }
+    }
+
+    void loadSnapshot();
+    const timer = window.setInterval(
+      () => void loadSnapshot(),
+      INITIAL_PERFORMANCE_POLL_SECONDS * 1000,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
